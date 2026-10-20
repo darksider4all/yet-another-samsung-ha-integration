@@ -892,26 +892,170 @@ def _ha_request(path, method="GET", body=None):
         return json.loads(txt) if txt else None
 
 
-def ha_lights():
+# ---- entity categories ------------------------------------------------------
+# A tile's control type is derived from the entity itself, the way HomeKit
+# picks an accessory type: domain first, then device_class, then
+# supported_features. Nothing is hardcoded per device, so any entity the user
+# selects gets the right kind of control automatically.
+CATEGORY_BY_DOMAIN = {
+    "light": "light",
+    "switch": "switch",
+    "input_boolean": "switch",
+    "fan": "fan",
+    "cover": "cover",
+    "lock": "lock",
+    "climate": "climate",
+    "water_heater": "climate",
+    "humidifier": "climate",
+    "media_player": "media_player",
+    "camera": "camera",
+    "vacuum": "vacuum",
+    "sensor": "sensor",
+    "binary_sensor": "sensor",
+    "scene": "scene",
+    "script": "script",
+    "button": "button",
+    "number": "number",
+    "input_number": "number",
+    "select": "select",
+    "input_select": "select",
+    "alarm_control_panel": "alarm",
+    "person": "person",
+    "device_tracker": "tracker",
+    "weather": "weather",
+    "update": "update",
+    "sun": "sensor",
+}
+
+# Where a device_class deserves its own accessory type rather than the domain's.
+DEVICE_CLASS_CATEGORY = {
+    ("switch", "outlet"): "outlet",
+    ("cover", "garage"): "garage_door",
+    ("cover", "gate"): "gate",
+    ("cover", "door"): "door",
+    ("cover", "window"): "window",
+    ("binary_sensor", "door"): "contact",
+    ("binary_sensor", "window"): "contact",
+    ("binary_sensor", "garage_door"): "contact",
+    ("binary_sensor", "motion"): "motion",
+    ("binary_sensor", "occupancy"): "motion",
+    ("binary_sensor", "presence"): "motion",
+    ("binary_sensor", "moisture"): "moisture",
+    ("binary_sensor", "smoke"): "smoke",
+    ("sensor", "temperature"): "temperature",
+    ("sensor", "humidity"): "humidity",
+    ("sensor", "illuminance"): "illuminance",
+    ("sensor", "power"): "power",
+    ("sensor", "energy"): "energy",
+    ("sensor", "battery"): "battery",
+}
+
+TOGGLEABLE_DOMAINS = {"light", "switch", "input_boolean", "fan", "cover", "lock",
+                      "media_player", "scene", "script", "vacuum", "humidifier"}
+
+# States that count as "active" for the tile highlight, per domain family.
+ACTIVE_STATES = {"on", "open", "opening", "playing", "cleaning", "unlocked", "heat",
+                 "cool", "heat_cool", "auto", "dry", "fan_only"}
+
+
+def _attrs_of(state):
+    return (state or {}).get("attributes") or {}
+
+
+def entity_category(state):
+    dom = ((state or {}).get("entity_id") or "").split(".", 1)[0]
+    dc = _attrs_of(state).get("device_class")
+    return DEVICE_CLASS_CATEGORY.get((dom, dc)) or CATEGORY_BY_DOMAIN.get(dom, dom or "unknown")
+
+
+def entity_capabilities(state):
+    """Which controls the tile should offer — mirrors HomeKit's characteristic set."""
+    dom = ((state or {}).get("entity_id") or "").split(".", 1)[0]
+    attrs = _attrs_of(state)
+    feats = int(attrs.get("supported_features") or 0)
+    caps = []
+    if dom in TOGGLEABLE_DOMAINS:
+        caps.append("toggle")
+    if dom == "light":
+        modes = set(attrs.get("supported_color_modes") or [])
+        if not modes or "brightness" in modes or "brightness" in attrs or feats & 1:
+            caps.append("dim")
+        if modes & {"color_temp", "hs", "xy", "rgb", "rgbw", "rgbww"} or feats & 2:
+            caps.append("color_temp")
+        if modes & {"hs", "xy", "rgb", "rgbw", "rgbww"}:
+            caps.append("color")
+    if dom == "cover":
+        if feats & 4:
+            caps.append("position")
+        if feats & 3:
+            caps.append("open_close")
+    if dom == "climate":
+        if feats & 1:
+            caps.append("temperature")
+        if feats & 2:
+            caps.append("target_temp")
+    if dom == "media_player":
+        if feats & 4:
+            caps.append("volume")
+        if feats & 128:
+            caps.append("play_pause")
+    return caps
+
+
+def entity_record(state, name=None):
+    """One tile: identity, category, live value and the controls it supports."""
+    state = state or {}
+    eid = state.get("entity_id") or ""
+    dom = eid.split(".", 1)[0]
+    attrs = _attrs_of(state)
+    st = state.get("state")
+    br = attrs.get("brightness")
+    unit = attrs.get("unit_of_measurement")
+    try:
+        value = float(st) if st not in (None, "unknown", "unavailable") else None
+    except (TypeError, ValueError):
+        value = None
+    return {
+        "entity_id": eid,
+        "name": name or attrs.get("friendly_name") or eid,
+        "domain": dom,
+        "category": entity_category(state),
+        "device_class": attrs.get("device_class"),
+        "state": st,
+        "on": st in ACTIVE_STATES,
+        "available": st not in ("unavailable", "unknown", None),
+        "reachable": st not in ("unavailable", "unknown", None),  # legacy key
+        "value": value,
+        "unit": unit,
+        "brightness": (round(br / 255 * 100) if isinstance(br, (int, float)) else None),
+        "capabilities": entity_capabilities(state),
+    }
+
+
+def ha_entity_view(category=None):
+    """The configured tiles, classified. `main_entities` wins over `main_lights`."""
     states = _ha_request("/api/states")
-    by_id = {s["entity_id"]: s for s in states}
+    by_id = {s.get("entity_id"): s for s in states}
+    wanted = _cfg("main_entities", None)
+    if not wanted:
+        wanted = [i if isinstance(i, str) else i.get("entity_id") for i in (_cfg("main_lights", []) or [])]
     out = []
-    for item in _cfg("main_lights", []):
-        eid = item.get("entity_id"); name = item.get("name") or eid
+    for item in wanted:
+        if isinstance(item, str):
+            item = {"entity_id": item}
+        eid = (item or {}).get("entity_id")
         if not eid:
             continue
-        s = by_id.get(eid)
-        if not s:
-            out.append({"entity_id": eid, "name": name, "state": "unknown", "on": False, "reachable": False})
-            continue
-        st = s.get("state")
-        br = (s.get("attributes") or {}).get("brightness")
-        out.append({
-            "entity_id": eid, "name": name, "state": st, "on": (st == "on"),
-            "brightness": (round(br / 255 * 100) if isinstance(br, (int, float)) else None),
-            "reachable": st not in ("unavailable", "unknown"),
-        })
+        rec = entity_record(by_id.get(eid) or {"entity_id": eid, "state": "unavailable"}, item.get("name"))
+        out.append(rec)
+    if category:
+        out = [r for r in out if r["category"] == category]
     return out
+
+
+def ha_lights():
+    """Legacy view: the togglable tiles only, in the pre-category shape."""
+    return ha_entity_view()
 
 
 def ha_entities():
@@ -1255,6 +1399,15 @@ def make_handler(state: TVState):
                     self._send(200, json.dumps({"lights": ha_lights()}).encode("utf-8"), "application/json")
                 except Exception as e:  # noqa: BLE001
                     self._send(502, json.dumps({"error": str(e)}).encode("utf-8"), "application/json")
+            elif self.path.startswith("/v1/entities"):
+                # Classified tiles: any domain, category derived from the entity.
+                # ?category=light filters; the app groups by `category`.
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    cat = (parse_qs(urlparse(self.path).query).get("category", [""])[0] or "").strip() or None
+                    self._send(200, json.dumps({"entities": ha_entity_view(cat)}).encode("utf-8"), "application/json")
+                except Exception as e:  # noqa: BLE001
+                    self._send(502, json.dumps({"error": str(e)}).encode("utf-8"), "application/json")
             elif self.path.startswith("/v1/commands"):
                 # long-poll: block up to 25s until a command is queued
                 deadline = time.time() + 25
@@ -1302,7 +1455,7 @@ def make_handler(state: TVState):
                 try:
                     n = int(self.headers.get("Content-Length", 0))
                     body = json.loads(self.rfile.read(n) or b"{}")
-                    for k in ("tv_ip", "tv_mac", "ha_url", "main_lights"):
+                    for k in ("tv_ip", "tv_mac", "ha_url", "main_lights", "main_entities"):
                         if k in body:
                             _CONFIG[k] = body[k]
                     if "notify_seconds" in body:

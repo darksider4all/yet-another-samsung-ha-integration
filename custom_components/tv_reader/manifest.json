@@ -10,5 +10,5 @@
   "iot_class": "local_polling",
   "requirements": [],
   "dependencies": [],
-  "version": "1.0.11"
+  "version": "1.0.12"
 }
