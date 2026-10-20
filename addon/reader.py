@@ -1032,7 +1032,28 @@ _AGENT = AgentState()
 # GET /v1/commands and executes them via Tizen APIs (reliable, unlike the
 # TV's remote-control WebSocket which does not register keys on this model).
 _cmd_cond = threading.Condition()
-_cmd_queue = deque()
+_cmd_queue = deque()  # (queued_at, cmd) — see take_commands()
+COMMAND_TTL = 30.0  # a command nobody polled for this long is dropped, never delivered
+# Consumed by GET /v1/launchmode: "foreground" = open the dashboard, "background" =
+# stay hidden (the power-on watchdog sets this). Must exist at module level: the
+# handler's `global _LAUNCH_MODE` does not create it, and the first GET used to
+# raise NameError and drop the connection.
+_LAUNCH_MODE = "foreground"
+
+# --- request counters (GET /v1/diag) ---------------------------------------
+# The access log is deliberately silent, which makes "is the TV app actually
+# polling /v1/lights?" unanswerable from HA. These counters answer it.
+_STARTED_AT = time.time()
+_diag_lock = threading.Lock()
+_diag = {}
+
+
+def _note_request(path):
+    p = path.split("?")[0]
+    with _diag_lock:
+        e = _diag.setdefault(p, {"count": 0, "last": 0.0})
+        e["count"] += 1
+        e["last"] = time.time()
 # Power on/off is NOT available locally on this TV (remotepower is NotSupported,
 # WoL doesn't wake Wi-Fi, remote-WS keys don't register) - the HA integration does
 # power via the samsungtv_smart/SmartThings delegate instead.
@@ -1043,8 +1064,29 @@ AGENT_ACTIONS = {"volume_up", "volume_down", "set_volume", "mute",
 
 def enqueue_command(cmd):
     with _cmd_cond:
-        _cmd_queue.append(cmd)
+        _cmd_queue.append((time.time(), cmd))
         _cmd_cond.notify_all()
+
+
+def take_commands():
+    """Pop all queued commands, discarding any that went stale while the agent was away.
+
+    Without this, a command queued while the TV app was offline (e.g. a notify
+    toast) would still fire minutes later and could stomp a fresh one.
+    """
+    now = time.time()
+    out = []
+    dropped = 0
+    with _cmd_cond:
+        while _cmd_queue:
+            queued_at, cmd = _cmd_queue.popleft()
+            if now - queued_at <= COMMAND_TTL:
+                out.append(cmd)
+            else:
+                dropped += 1
+    if dropped:
+        print(f"dropped {dropped} stale command(s) older than {COMMAND_TTL:.0f}s", flush=True)
+    return out
 
 
 # Pending toast: set by POST /v1/notify, consumed once by the agent on (re)launch
@@ -1052,7 +1094,7 @@ def enqueue_command(cmd):
 # be carried in-process; the freshly loaded agent fetches it here instead.
 _toast_lock = threading.Lock()
 _toast = {"data": None, "ts": 0.0}
-TOAST_TTL = 25.0
+TOAST_TTL = 60.0
 
 
 def set_toast(payload):
@@ -1086,6 +1128,7 @@ def make_handler(state: TVState):
             self.wfile.write(body_bytes)
 
         def do_GET(self):  # noqa: N802
+            _note_request(self.path)
             if self.path == "/v1/state":
                 snap = state.snapshot()
                 snap["agent"] = _AGENT.snapshot()
@@ -1172,17 +1215,33 @@ def make_handler(state: TVState):
                 with _cmd_cond:
                     while not _cmd_queue and time.time() < deadline:
                         _cmd_cond.wait(timeout=max(0.0, deadline - time.time()))
-                    cmds = list(_cmd_queue)
-                    _cmd_queue.clear()
+                cmds = take_commands()
                 self._send(200, json.dumps({"commands": cmds}).encode("utf-8"), "application/json")
             elif self.path == "/" or self.path == "/index.html":
                 self._send(200, CONFIG_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif self.path == "/v1/ping":
                 self._send(200, json.dumps({"service": "yast-bridge", "ok": True}).encode("utf-8"), "application/json")
+            elif self.path == "/v1/diag":
+                now = time.time()
+                with _diag_lock:
+                    reqs = {
+                        p: {"count": v["count"], "seconds_since_last": round(now - v["last"], 1)}
+                        for p, v in sorted(_diag.items())
+                    }
+                payload = {
+                    "uptime_s": round(now - _STARTED_AT, 1),
+                    "agent_online": bool(_AGENT.snapshot().get("online")),
+                    "queued_commands": len(_cmd_queue),
+                    "toast_pending": bool(_toast["data"]) and (now - _toast["ts"]) < TOAST_TTL,
+                    "launch_mode": _LAUNCH_MODE,
+                    "requests": reqs,
+                }
+                self._send(200, json.dumps(payload).encode("utf-8"), "application/json")
             else:
                 self._send(404, b"not found", "text/plain")
 
         def do_POST(self):  # noqa: N802
+            _note_request(self.path)
             if self.path == "/v1/launchmode":
                 try:
                     n = int(self.headers.get("Content-Length", 0))

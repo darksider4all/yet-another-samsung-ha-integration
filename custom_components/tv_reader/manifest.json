@@ -1,12 +1,14 @@
 {
   "domain": "tv_reader",
   "name": "Yet Another Samsung Thing",
-  "codeowners": ["@darksider4all"],
+  "codeowners": [
+    "@darksider4all"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/darksider4all/yet-another-samsung-ha-integration",
   "issue_tracker": "https://github.com/darksider4all/yet-another-samsung-ha-integration/issues",
   "iot_class": "local_polling",
   "requirements": [],
   "dependencies": [],
-  "version": "1.0.7"
+  "version": "1.0.8"
 }
