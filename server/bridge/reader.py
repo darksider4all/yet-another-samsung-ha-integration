@@ -228,14 +228,15 @@ CONFIG_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 </div>
 
 <div class="step">
-  <h2>4 &middot; Lights</h2>
-  <div class="muted">Pick the lights/switches to show on the TV dashboard.</div>
+  <h2>4 &middot; Dashboard tiles</h2>
+  <div class="muted">Pick the entities to show on the TV — any category. Each tile gets the control its entity supports (dim, colour, position, temperature…), so you are not limited to lights and switches.</div>
   <div class="ltools">
+    <select id="lcat" class="fld" onchange="filterLights()" style="flex:0 1 190px;margin-top:0"></select>
     <input id="lsearch" class="fld" type="search" placeholder="Search entities…" oninput="filterLights()">
     <span id="lcount" class="muted">0 selected</span>
     <button class="ghost sm" onclick="clearLights()">Clear</button>
   </div>
-  <div id="lights" class="list"><div class="empty">Connect Home Assistant above to load your lights &amp; switches.</div></div>
+  <div id="lights" class="list"><div class="empty">Connect Home Assistant above to load your entities.</div></div>
 </div>
 
 <div class="step">
@@ -277,7 +278,7 @@ async function init(){
     if(c.notify_seconds) $('notify_seconds').value=c.notify_seconds;
     LAN_IP=c.lan_ip||'';
     $('auto_load').checked = (c.auto_load !== false);
-    (c.main_lights||[]).forEach(function(l){ CHECKED[l.entity_id]={name:l.name}; });
+    (c.main_entities||c.main_lights||[]).forEach(function(l){ CHECKED[l.entity_id]={name:l.name}; });
     updateCount();
   }catch(e){}
 }
@@ -304,24 +305,24 @@ async function testHA(){
     if(!r.ok){ $('hstat').innerHTML='<span class="bad">&#10007; '+esc((await r.json()).error||'failed')+'</span>'; return; }
     ENTITIES=(await r.json()).entities||[];
     $('hstat').innerHTML='<span class="ok">&#10003; connected &middot; '+ENTITIES.length+' entities</span>';
-    renderLights();
+    renderCatalog();
   }catch(e){ $('hstat').innerHTML='<span class="bad">&#10007; '+e+'</span>'; }
 }
-function groupOf(id){ return (id.split('.')[0]||'other'); }
-function renderLights(){
-  if(!ENTITIES.length){ $('lights').innerHTML='<div class="empty">No lights or switches found.</div>'; return; }
-  var groups={}; ENTITIES.forEach(function(e){ (groups[groupOf(e.entity_id)]=groups[groupOf(e.entity_id)]||[]).push(e); });
-  var titles={light:'Lights',switch:'Switches'};
-  var order=Object.keys(groups).sort(function(a,b){ var r={light:0,switch:1}; return (r[a]==null?9:r[a])-(r[b]==null?9:r[b]); });
+var CAT_TITLE={light:'Lights',switch:'Switches',outlet:'Outlets',cover:'Covers',garage_door:'Garage doors',gate:'Gates',door:'Doors',window:'Windows',lock:'Locks',climate:'Climate',fan:'Fans',media_player:'Media',camera:'Cameras',vacuum:'Vacuums',scene:'Scenes',script:'Scripts',button:'Buttons',number:'Numbers',select:'Selects',alarm:'Alarm',contact:'Contacts',motion:'Motion',moisture:'Moisture',smoke:'Smoke',temperature:'Temperature',humidity:'Humidity',illuminance:'Illuminance',power:'Power',energy:'Energy',battery:'Battery',weather:'Weather',sensor:'Sensors'};
+function catTitle(c){ return CAT_TITLE[c]||(c?(c.charAt(0).toUpperCase()+c.slice(1)):'Other'); }
+function renderCatalog(){
+  if(!ENTITIES.length){ $('lights').innerHTML='<div class="empty">No entities found.</div>'; return; }
+  var groups={}; ENTITIES.forEach(function(e){ var c=e.category||'other'; (groups[c]=groups[c]||[]).push(e); });
+  var cats=Object.keys(groups).sort(function(a,b){ return catTitle(a).localeCompare(catTitle(b)); });
   var html='';
-  order.forEach(function(dom){
-    var arr=groups[dom].slice().sort(function(a,b){return (a.name||'').localeCompare(b.name||'');});
-    html+='<div class="grp" data-grp="'+dom+'"><span>'+(titles[dom]||dom)+' ('+arr.length+')</span>'
-        +'<button class="link" data-all="'+dom+'">select all</button></div>';
+  cats.forEach(function(cat){
+    var arr=groups[cat].slice().sort(function(a,b){return (a.name||'').localeCompare(b.name||'');});
+    html+='<div class="grp" data-grp="'+esc(cat)+'"><span>'+esc(catTitle(cat))+' ('+arr.length+')</span>'
+        +'<button class="link" data-all="'+esc(cat)+'">select all</button></div>';
     html+=arr.map(function(e){
       var on=CHECKED[e.entity_id]?'checked':'';
-      var txt=((e.name||'')+' '+e.entity_id).toLowerCase();
-      return '<label class="row" data-text="'+esc(txt)+'">'
+      var txt=((e.name||'')+' '+e.entity_id+' '+catTitle(cat)).toLowerCase();
+      return '<label class="row" data-cat="'+esc(cat)+'" data-text="'+esc(txt)+'">'
         +'<input type="checkbox" class="chk" data-e="'+esc(e.entity_id)+'" data-n="'+esc(e.name||e.entity_id)+'" '+on+'>'
         +'<span><span class="nm">'+esc(e.name||e.entity_id)+'</span><span class="eid">'+esc(e.entity_id)+'</span></span>'
         +'<span class="badge'+(e.state==='on'?' on':'')+'">'+esc(e.state||'')+'</span>'
@@ -329,6 +330,7 @@ function renderLights(){
     }).join('');
   });
   $('lights').innerHTML=html;
+  buildCatSelect(cats,groups);
   $('lights').querySelectorAll('input.chk').forEach(function(cb){
     cb.onchange=function(){ if(cb.checked) CHECKED[cb.dataset.e]={name:cb.dataset.n}; else delete CHECKED[cb.dataset.e]; updateCount(); };
   });
@@ -337,18 +339,29 @@ function renderLights(){
       var boxes=[]; $('lights').querySelectorAll('.grp[data-grp="'+b.dataset.all+'"] ~ label').forEach(function(){});
       // gather rows that belong to this group (until next grp)
       var hdr=b.closest('.grp'), n=hdr.nextElementSibling;
-      while(n && !n.classList.contains('grp')){ var c=n.querySelector('input.chk'); if(c) boxes.push(c); n=n.nextElementSibling; }
+      while(n && !n.classList.contains('grp')){ var c=n.querySelector('input.chk'); if(c && n.style.display!=='none') boxes.push(c); n=n.nextElementSibling; }
       var anyUnchecked=boxes.some(function(c){return !c.checked;});
       boxes.forEach(function(c){ c.checked=anyUnchecked; if(anyUnchecked) CHECKED[c.dataset.e]={name:c.dataset.n}; else delete CHECKED[c.dataset.e]; });
       b.textContent=anyUnchecked?'clear all':'select all'; updateCount();
     };
   });
   updateCount();
+  filterLights();
+}
+function buildCatSelect(cats,groups){
+  var sel=$('lcat'); if(!sel) return;
+  var cur=sel.value||'';
+  var opts='<option value="">All categories ('+ENTITIES.length+')</option>';
+  cats.forEach(function(c){ opts+='<option value="'+esc(c)+'">'+esc(catTitle(c))+' ('+groups[c].length+')</option>'; });
+  sel.innerHTML=opts;
+  if(cur && cats.indexOf(cur)>=0) sel.value=cur;
 }
 function filterLights(){
   var q=$('lsearch').value.trim().toLowerCase();
+  var cat=($('lcat')||{}).value||'';
   $('lights').querySelectorAll('label.row').forEach(function(r){
-    r.style.display = (!q || r.dataset.text.indexOf(q)>=0) ? '' : 'none';
+    var ok=(!cat || r.dataset.cat===cat) && (!q || r.dataset.text.indexOf(q)>=0);
+    r.style.display=ok?'':'none';
   });
   // hide group headers with no visible rows
   $('lights').querySelectorAll('.grp').forEach(function(h){
@@ -417,13 +430,13 @@ async function pair(){
 }
 async function saveAll(){
   var ml=Object.keys(CHECKED).map(function(id){ return {entity_id:id, name:CHECKED[id].name}; });
-  var body={tv_ip:$('tv_ip').value.trim(), tv_mac:$('tv_mac').value.trim(), ha_url:$('ha_url').value.trim(), main_lights:ml};
+  var body={tv_ip:$('tv_ip').value.trim(), tv_mac:$('tv_mac').value.trim(), ha_url:$('ha_url').value.trim(), main_entities:ml};
   if($('ha_token').value) body.ha_token=$('ha_token').value;
   var ns=parseInt($('notify_seconds').value,10); if(ns>0) body.notify_seconds=ns;
   body.auto_load=$('auto_load').checked;
   $('sstat').textContent='saving…';
   var r=await fetch('v1/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  $('sstat').innerHTML=r.ok?'<span class="ok">&#10003; saved &middot; '+ml.length+' lights</span>':'<span class="bad">&#10007; save failed</span>';
+  $('sstat').innerHTML=r.ok?'<span class="ok">&#10003; saved &middot; '+ml.length+' tiles</span>':'<span class="bad">&#10007; save failed</span>';
   if(r.ok) $('ha_token').value='';
 }
 init();
@@ -1058,16 +1071,42 @@ def ha_lights():
     return ha_entity_view()
 
 
+# The setup wizard offers every entity that can render as a tile. Domains that
+# are pure bookkeeping (or that HA exposes but nothing belongs on a TV) are
+# dropped, so the picker lists what a dashboard can actually use — grouped by
+# the same category the app renders, never by domain.
+WIZARD_EXCLUDED_DOMAINS = {
+    "automation", "zone", "group", "tag", "persistent_notification", "todo",
+    "calendar", "event", "notify", "conversation", "tts", "stt", "remote",
+    "text", "input_text", "input_button", "input_datetime", "time", "date",
+    "datetime", "image", "counter", "timer", "schedule", "update", "person",
+    "device_tracker", "sun", "valve", "assist_satellite",
+}
+
+
 def ha_entities():
-    """light.* and switch.* entities from HA, for the setup wizard's light picker."""
-    states = _ha_request("/api/states")
+    """Every tileable entity, classified, for the setup wizard's picker.
+
+    Returns the same `category` the app renders with, so the wizard and the TV
+    agree on what a tile is — the picker no longer assumes light/switch.
+    """
+    states = _ha_request("/api/states") or []
     out = []
-    for st in states:
-        eid = st.get("entity_id", ""); dom = eid.split(".")[0]
-        if dom in ("light", "switch"):
-            out.append({"entity_id": eid, "domain": dom, "state": st.get("state"),
-                        "name": (st.get("attributes") or {}).get("friendly_name") or eid})
-    out.sort(key=lambda x: x["name"].lower())
+    for s in states:
+        eid = (s or {}).get("entity_id") or ""
+        dom = eid.split(".", 1)[0]
+        if not dom or dom in WIZARD_EXCLUDED_DOMAINS:
+            continue
+        rec = entity_record(s)
+        out.append({
+            "entity_id": rec["entity_id"],
+            "name": rec["name"],
+            "domain": dom,
+            "category": rec["category"],
+            "device_class": rec["device_class"],
+            "state": rec["state"],
+        })
+    out.sort(key=lambda x: (x["category"] or "", x["name"].lower()))
     return out
 
 
