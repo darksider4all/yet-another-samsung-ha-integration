@@ -118,6 +118,17 @@ class EntityViewTest(unittest.TestCase):
         for key in ("entity_id", "name", "state", "on", "brightness", "reachable"):
             self.assertIn(key, view[0])
 
+    def test_legacy_lights_view_drops_read_only_tiles(self):
+        self.mod._CONFIG["main_entities"] = [
+            {"entity_id": "light.sofa"}, {"entity_id": "sensor.living_temp"},
+            {"entity_id": "cover.garage"},
+        ]
+        view = self.mod.ha_lights()
+        ids = [r["entity_id"] for r in view]
+        self.assertIn("light.sofa", ids)
+        self.assertIn("cover.garage", ids, "a cover can be toggled")
+        self.assertNotIn("sensor.living_temp", ids, "the TV app would paint it as a dead switch")
+
 
 if __name__ == "__main__":
     unittest.main()

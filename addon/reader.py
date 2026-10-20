@@ -280,6 +280,9 @@ async function init(){
     $('auto_load').checked = (c.auto_load !== false);
     (c.main_entities||c.main_lights||[]).forEach(function(l){ CHECKED[l.entity_id]={name:l.name}; });
     updateCount();
+    // Populate the category picker straight away; the saved token is already
+    // good, so making the user press "Test & load entities" again is a wart.
+    if(c.ha_token_set) loadEntities(true);
   }catch(e){}
 }
 async function discover(){
@@ -300,13 +303,17 @@ async function testHA(){
   $('hstat').textContent='connecting…';
   var body={ha_url:url}; if(tok) body.ha_token=tok;
   await fetch('v1/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await loadEntities(false);
+}
+async function loadEntities(silent){
   try{
     var r=await fetch('v1/ha_entities',{cache:'no-store'});
-    if(!r.ok){ $('hstat').innerHTML='<span class="bad">&#10007; '+esc((await r.json()).error||'failed')+'</span>'; return; }
+    if(!r.ok){ if(!silent) $('hstat').innerHTML='<span class="bad">&#10007; '+esc((await r.json()).error||'failed')+'</span>'; return false; }
     ENTITIES=(await r.json()).entities||[];
-    $('hstat').innerHTML='<span class="ok">&#10003; connected &middot; '+ENTITIES.length+' entities</span>';
+    if(!silent) $('hstat').innerHTML='<span class="ok">&#10003; connected &middot; '+ENTITIES.length+' entities</span>';
     renderCatalog();
-  }catch(e){ $('hstat').innerHTML='<span class="bad">&#10007; '+e+'</span>'; }
+    return true;
+  }catch(e){ if(!silent) $('hstat').innerHTML='<span class="bad">&#10007; '+e+'</span>'; return false; }
 }
 var CAT_TITLE={light:'Lights',switch:'Switches',outlet:'Outlets',cover:'Covers',garage_door:'Garage doors',gate:'Gates',door:'Doors',window:'Windows',lock:'Locks',climate:'Climate',fan:'Fans',media_player:'Media',camera:'Cameras',vacuum:'Vacuums',scene:'Scenes',script:'Scripts',button:'Buttons',number:'Numbers',select:'Selects',alarm:'Alarm',contact:'Contacts',motion:'Motion',moisture:'Moisture',smoke:'Smoke',temperature:'Temperature',humidity:'Humidity',illuminance:'Illuminance',power:'Power',energy:'Energy',battery:'Battery',weather:'Weather',sensor:'Sensors'};
 function catTitle(c){ return CAT_TITLE[c]||(c?(c.charAt(0).toUpperCase()+c.slice(1)):'Other'); }
@@ -1067,8 +1074,13 @@ def ha_entity_view(category=None):
 
 
 def ha_lights():
-    """Legacy view: the togglable tiles only, in the pre-category shape."""
-    return ha_entity_view()
+    """Legacy view: the togglable tiles only, in the pre-category shape.
+
+    The app shipped on the TV paints every row as an on/off tile and toggles it
+    on Enter, so read-only entities are dropped here — otherwise a selected
+    sensor would render as a dead switch. /v1/entities carries the full selection.
+    """
+    return [r for r in ha_entity_view() if "toggle" in r["capabilities"]]
 
 
 # The setup wizard offers every entity that can render as a tile. Domains that
