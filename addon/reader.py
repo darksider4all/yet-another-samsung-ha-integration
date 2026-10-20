@@ -711,6 +711,24 @@ def control_launch_app(app_id: str) -> bool:
     return True
 
 
+DEFAULT_AGENT_APP = "ChanProbe0.ChannelProbe"
+
+
+def launch_agent() -> tuple:
+    """Bring the on-TV agent to the foreground. Returns (ok, error).
+
+    Tizen suspends the timers of a hidden web app, so a backgrounded agent can
+    never poll the command queue: launching it is the only reliable way to wake
+    it. Its boot path then fetches /v1/toast and paints the pending message.
+    """
+    app_id = _cfg("agent_app_id", "") or DEFAULT_AGENT_APP
+    try:
+        control_launch_app(app_id)
+        return True, None
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+
+
 def control_close_app(app_id: str) -> bool:
     _rest_request(f"applications/{app_id}", "DELETE")
     return True
@@ -1058,8 +1076,10 @@ def _note_request(path):
 # WoL doesn't wake Wi-Fi, remote-WS keys don't register) - the HA integration does
 # power via the samsungtv_smart/SmartThings delegate instead.
 AGENT_ACTIONS = {"volume_up", "volume_down", "set_volume", "mute",
-                 "channel_up", "channel_down", "tune_channel", "notify", "hide",
-                 "launch_app"}
+                 "channel_up", "channel_down", "tune_channel", "notify", "hide"}
+# launch_app is deliberately NOT an agent action: a hidden Tizen app has its
+# timers suspended, so handing a "launch yourself" command to it can never work.
+# It must run bridge-side through CONTROL_ACTIONS, which talks to the TV's REST API.
 
 
 def enqueue_command(cmd):
@@ -1330,9 +1350,28 @@ def make_handler(state: TVState):
                         raise ValueError("missing 'message'")
                     duration = int(body.get("duration") or _cfg("notify_seconds", 8) or 8)
                     set_toast({"message": str(msg), "duration": duration})
-                    enqueue_command({"action": "notify", "message": str(msg), "duration": duration})
+                    # A hidden Tizen app has its timers suspended, so it can never
+                    # poll the command queue by itself: launch it. Its boot path
+                    # fetches /v1/toast and paints the message. Only fall back to the
+                    # queue when the launch fails, otherwise the queued `notify` would
+                    # cause a second relaunch that wipes the toast it just showed.
+                    launched, launch_error = launch_agent()
+                    if not launched:
+                        enqueue_command({"action": "notify", "message": str(msg), "duration": duration})
                     online = _AGENT.snapshot().get("online")
-                    self._send(200, json.dumps({"ok": True, "queued": True, "agent_online": bool(online)}).encode("utf-8"), "application/json")
+                    self._send(
+                        200,
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "launched": launched,
+                                "queued": not launched,
+                                "launch_error": launch_error,
+                                "agent_online": bool(online),
+                            }
+                        ).encode("utf-8"),
+                        "application/json",
+                    )
                 except Exception as e:
                     self._send(400, json.dumps({"error": str(e)}).encode("utf-8"), "application/json")
                 return

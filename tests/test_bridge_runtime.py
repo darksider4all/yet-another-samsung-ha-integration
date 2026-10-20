@@ -56,6 +56,14 @@ class BridgeTest(unittest.TestCase):
         with urllib.request.urlopen(url, timeout=10) as r:
             return r.status, json.loads(r.read().decode() or "{}")
 
+    def post(self, path, payload):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+
 
 class LaunchModeTest(BridgeTest):
     def test_launch_mode_has_a_module_level_default(self):
@@ -101,6 +109,55 @@ class DiagTest(BridgeTest):
         self.assertIn("agent_online", body)
         self.assertIn("toast_pending", body)
         self.assertIn("queued_commands", body)
+
+
+class LaunchRoutingTest(BridgeTest):
+    """launch_app must run bridge-side; a suspended app cannot launch itself."""
+
+    def test_launch_app_is_not_an_agent_action(self):
+        self.assertNotIn("launch_app", self.mod.AGENT_ACTIONS)
+
+    def test_launch_app_is_a_server_side_control_action(self):
+        self.assertIn("launch_app", self.mod.CONTROL_ACTIONS)
+
+    def test_launch_app_calls_the_tv_rest_api(self):
+        called = []
+        self.mod.control_launch_app = lambda app_id: called.append(app_id) or True
+        status, body = self.post("/v1/control", {"action": "launch_app", "app_id": "ChanProbe0.ChannelProbe"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(called, ["ChanProbe0.ChannelProbe"])
+
+
+class NotifyLaunchesAgentTest(BridgeTest):
+    def test_notify_launches_the_agent_and_does_not_queue(self):
+        calls = []
+        self.mod.control_launch_app = lambda app_id: calls.append(app_id) or True
+        status, body = self.post("/v1/notify", {"message": "hello"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["launched"], "notify must launch the hidden agent")
+        self.assertFalse(body["queued"], "a launch makes the queued notify redundant")
+        self.assertEqual(calls, [self.mod.DEFAULT_AGENT_APP])
+        self.assertEqual(self.mod.take_commands(), [], "nothing may be left queued")
+
+    def test_notify_falls_back_to_the_queue_when_the_launch_fails(self):
+        def boom(app_id):
+            raise RuntimeError("tv unreachable")
+
+        self.mod.control_launch_app = boom
+        status, body = self.post("/v1/notify", {"message": "hello"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["launched"])
+        self.assertTrue(body["queued"])
+        self.assertIn("tv unreachable", body["launch_error"])
+        cmds = self.mod.take_commands()
+        self.assertEqual([c["action"] for c in cmds], ["notify"])
+
+    def test_notify_still_stores_the_toast(self):
+        self.mod.control_launch_app = lambda app_id: True
+        self.post("/v1/notify", {"message": "hey", "duration": 12})
+        _, diag = self.get("/v1/diag")
+        self.assertTrue(diag["toast_pending"])
 
 
 if __name__ == "__main__":
