@@ -718,11 +718,19 @@ def launch_agent() -> tuple:
     """Bring the on-TV agent to the foreground. Returns (ok, error).
 
     Tizen suspends the timers of a hidden web app, so a backgrounded agent can
-    never poll the command queue: launching it is the only reliable way to wake
-    it. Its boot path then fetches /v1/toast and paints the pending message.
+    never poll the command queue: only an external launch can wake it, and its
+    boot path then fetches /v1/toast and paints the pending message.
+
+    A plain launch is a no-op while the app is already running (verified on the
+    TV: POST returns true, visible stays false, no boot). Closing first forces a
+    fresh start, which is what actually surfaces the window.
     """
     app_id = _cfg("agent_app_id", "") or DEFAULT_AGENT_APP
     try:
+        try:
+            control_close_app(app_id)
+        except Exception:  # noqa: BLE001 - not running is fine
+            pass
         control_launch_app(app_id)
         return True, None
     except Exception as e:  # noqa: BLE001
