@@ -1,0 +1,97 @@
+launch_app:
+  name: Launch app
+  description: Launch an app by its Tizen app id on the Samsung TV.
+  fields:
+    app_id:
+      name: App ID
+      description: Tizen app id (e.g. 111299001912 for YouTube).
+      required: true
+      example: "111299001912"
+      selector:
+        text:
+
+close_app:
+  name: Close app
+  description: Close an app by its Tizen app id.
+  fields:
+    app_id:
+      name: App ID
+      description: Tizen app id to close.
+      required: true
+      example: "111299001912"
+      selector:
+        text:
+
+send_key:
+  name: Send key
+  description: Send a remote-control key to the TV.
+  fields:
+    key:
+      name: Key
+      description: A Samsung remote key (e.g. KEY_HOME, KEY_VOLUP, KEY_CHUP).
+      required: true
+      example: "KEY_HOME"
+      selector:
+        text:
+send_toast:
+  name: Send toast
+  description: Show a message on the TV screen (via the on-TV agent).
+  target:
+    entity:
+      integration: tv_reader
+      domain: media_player
+  fields:
+    message:
+      name: Message
+      description: Text to display on the TV.
+      required: true
+      example: "Dinner is ready"
+      selector:
+        text:
+
+tune_channel:
+  name: Tune channel
+  description: Tune the TV to a channel number.
+  target:
+    entity:
+      integration: tv_reader
+      domain: media_player
+  fields:
+    number:
+      name: Channel number
+      description: Channel number to tune to.
+      required: true
+      example: "33"
+      selector:
+        text:
+
+cast:
+  name: Cast media
+  description: Show an image/video/web page full-screen on the TV (then returns to live TV).
+  target:
+    entity:
+      integration: tv_reader
+      domain: media_player
+  fields:
+    url:
+      name: URL
+      description: Image, video, or web page URL.
+      required: true
+      example: "https://example.com/photo.jpg"
+      selector:
+        text:
+    kind:
+      name: Kind
+      description: image, video, or web (auto-detected if omitted).
+      required: false
+      selector:
+        select:
+          options: ["image", "video", "web"]
+    duration:
+      name: Duration (s)
+      description: Seconds to show (ignored for video, which plays to the end).
+      required: false
+      selector:
+        number:
+          min: 3
+          max: 600

@@ -1,0 +1,23 @@
+name: Yet Another Samsung Thing - Bridge
+version: "1.0.6"
+slug: tv_reader_bridge
+description: Local bridge between the Samsung TV app and Home Assistant (telemetry, control, lights, toast/cast).
+url: https://github.com/darksider4all/yet-another-samsung-ha-integration
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+  - i386
+init: false
+# SSDP TV auto-discovery needs multicast, which only reaches the add-on with host networking.
+host_network: true
+# Expose the setup wizard (served by the bridge on :8777) through the HA sidebar.
+ingress: true
+ingress_port: 8777
+panel_icon: mdi:television-guide
+panel_title: Samsung Bridge
+map:
+  - share:rw
+options: {}
+schema: {}

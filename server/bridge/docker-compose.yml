@@ -1,0 +1,21 @@
+services:
+  yast-bridge:
+    build: .
+    container_name: yast-bridge
+    restart: unless-stopped
+    # Host networking is REQUIRED for TV auto-discovery: SSDP (M-SEARCH) uses
+    # multicast, which Docker's default bridge network does not forward. With
+    # host networking the bridge listens on <host-ip>:8777 directly (no "ports:"
+    # mapping is used or allowed in this mode).
+    network_mode: host
+    environment:
+      - TV_TOKEN_FILE=/app/data/tv_token
+      - CONFIG_FILE=/app/data/config.json
+    volumes:
+      # Holds config.json (TV/HA/lights), the paired tv_token, and cast images.
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8777/v1/state', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

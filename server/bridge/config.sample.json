@@ -1,0 +1,10 @@
+{
+  "tv_ip": "192.168.1.50",
+  "tv_mac": "AA:BB:CC:DD:EE:FF",
+  "ha_url": "http://homeassistant.local:8123",
+  "ha_token": "",
+  "main_lights": [
+    { "entity_id": "light.living_room", "name": "Living room" },
+    { "entity_id": "light.kitchen",     "name": "Kitchen" }
+  ]
+}

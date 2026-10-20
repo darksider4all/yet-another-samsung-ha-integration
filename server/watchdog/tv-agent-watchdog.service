@@ -1,0 +1,14 @@
+[Unit]
+Description=Samsung TV agent watchdog (load the app once on TV power-on)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tv-agent-watchdog/watchdog.env
+ExecStart=/usr/bin/python3 /opt/tv-agent-watchdog/watchdog.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

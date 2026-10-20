@@ -1,0 +1,21 @@
+# secrets & per-install state — NEVER commit
+*.env
+ha.env
+*.p12
+*.pem
+*.key
+tv_token
+data/
+config.json
+server/bridge/data/
+# research / firmware / vendor blobs
+Samsung-TV-Research-*.md
+*.zip
+TizenBrewInstaller/
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# os
+.DS_Store
