@@ -123,10 +123,31 @@ class LaunchRoutingTest(BridgeTest):
     def test_launch_app_calls_the_tv_rest_api(self):
         called = []
         self.mod.control_launch_app = lambda app_id: called.append(app_id) or True
+        self.mod.control_close_app = lambda app_id: True
         status, body = self.post("/v1/control", {"action": "launch_app", "app_id": "ChanProbe0.ChannelProbe"})
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertEqual(called, ["ChanProbe0.ChannelProbe"])
+
+    def test_launch_agent_closes_before_launching(self):
+        order = []
+        self.mod.control_close_app = lambda app_id: order.append(("close", app_id)) or True
+        self.mod.control_launch_app = lambda app_id: order.append(("launch", app_id)) or True
+        ok, err = self.mod.launch_agent()
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertEqual(order, [("close", self.mod.DEFAULT_AGENT_APP),
+                                 ("launch", self.mod.DEFAULT_AGENT_APP)])
+
+    def test_launch_agent_survives_a_close_failure(self):
+        def boom(app_id):
+            raise RuntimeError("not running")
+
+        self.mod.control_close_app = boom
+        self.mod.control_launch_app = lambda app_id: True
+        ok, err = self.mod.launch_agent()
+        self.assertTrue(ok, "a failed close must not stop the launch")
+        self.assertIsNone(err)
 
 
 class NotifyLaunchesAgentTest(BridgeTest):
