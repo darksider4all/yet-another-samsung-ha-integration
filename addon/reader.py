@@ -712,6 +712,15 @@ def control_launch_app(app_id: str) -> bool:
 
 
 DEFAULT_AGENT_APP = "ChanProbe0.ChannelProbe"
+CLOSE_WAIT = 3.0  # seconds to wait for the TV to actually stop the app
+
+
+def app_state(app_id: str) -> dict:
+    """Installed-app record from the TV's REST API ({'running': bool, ...})."""
+    try:
+        return json.loads(_rest_request(f"applications/{app_id}") or "{}")
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def launch_agent() -> tuple:
@@ -721,14 +730,23 @@ def launch_agent() -> tuple:
     never poll the command queue: only an external launch can wake it, and its
     boot path then fetches /v1/toast and paints the pending message.
 
-    A plain launch is a no-op while the app is already running (verified on the
-    TV: POST returns true, visible stays false, no boot). Closing first forces a
-    fresh start, which is what actually surfaces the window.
+    Two TV quirks, both verified on the device:
+      * POST is a no-op while the app is already running (returns true, window
+        never surfaces, no boot), so we close it first;
+      * DELETE is applied asynchronously — launching immediately gets the fresh
+        instance killed when the close finally lands ~3 s later, which shows the
+        toast for two seconds and looks like "notifications don't work".
+    Hence: close, wait for running:false, then launch.
     """
     app_id = _cfg("agent_app_id", "") or DEFAULT_AGENT_APP
     try:
         try:
             control_close_app(app_id)
+            deadline = time.time() + CLOSE_WAIT
+            while time.time() < deadline:
+                if not app_state(app_id).get("running", False):
+                    break
+                time.sleep(0.25)
         except Exception:  # noqa: BLE001 - not running is fine
             pass
         control_launch_app(app_id)
