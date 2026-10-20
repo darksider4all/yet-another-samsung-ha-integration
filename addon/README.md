@@ -50,5 +50,18 @@ All settings are entered in the wizard and saved to `/data/config.json`. Note th
 | TV IP / MAC | IP address / MAC |
 | Lights | Home Assistant `entity_id`s |
 
+**Where settings live:** `/data/config.json` on the add-on's own volume, together with the
+paired-TV token (`/data/tv_token`) and cast images (`/data/img`). `/data` survives add-on
+updates and rebuilds — it is only removed when the add-on is uninstalled. Settings are
+never written inside the image or to `/share` (which is network-exported).
+
+`CONFIG_FILE`, `TV_TOKEN_FILE` and `IMG_DIR` can override the three paths; the add-on's
+`run.sh` re-imports the environment with `with-contenv` because Home Assistant's
+s6-overlay base sweeps it away from the CMD.
+
+`GET /v1/config` reports `config_file` and `persisted`, and `POST /v1/config` answers
+**500** if the file cannot be written — so the wizard can no longer claim success while
+the settings are being dropped on the floor.
+
 > `addon/reader.py` is a copy of `server/bridge/reader.py` (HA add-ons build from
 > their own folder). They are kept identical; edit `server/bridge/reader.py` and copy.

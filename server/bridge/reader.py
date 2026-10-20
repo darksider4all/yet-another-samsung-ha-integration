@@ -46,9 +46,13 @@ REST_PORT = 8001
 CLIENT_NAME = "yast-bridge"
 HTTP_PORT = 8777
 POLL_INTERVAL = 4  # seconds between full probe cycles
-TOKEN_FILE = os.environ.get("TV_TOKEN_FILE", "/app/data/tv_token")
-CONFIG_FILE = os.environ.get("CONFIG_FILE", "/app/data/config.json")
-IMG_DIR = os.environ.get("IMG_DIR", "/app/data/img")
+# Persistent storage. The add-on's /data volume survives updates and rebuilds;
+# a path inside the image (/app/...) is wiped every time the container is
+# recreated, which silently loses the wizard config and the TV pairing token.
+DATA_DIR = os.environ.get("YAST_DATA_DIR") or os.environ.get("DATA_DIR") or "/data"
+TOKEN_FILE = os.environ.get("TV_TOKEN_FILE", os.path.join(DATA_DIR, "tv_token"))
+CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(DATA_DIR, "config.json"))
+IMG_DIR = os.environ.get("IMG_DIR", os.path.join(DATA_DIR, "img"))
 APP_WGT = os.environ.get("APP_WGT", "/app/app.wgt")  # bundled signed TV app, served at /app.wgt
 
 
@@ -71,8 +75,9 @@ def _seed_img():
 
 _seed_img()
 
-# ---- runtime configuration (data/config.json; editable live via /config) ----
+# ---- runtime configuration (config.json; editable live via /config) ----
 _CONFIG = {}
+_LAST_SAVE_ERROR = None
 
 
 def _load_config():
@@ -85,12 +90,24 @@ def _load_config():
 
 
 def _save_config():
+    """Persist _CONFIG to CONFIG_FILE.
+
+    Returns True on success, False on failure (never raises): callers must not
+    report success to the wizard unless the bytes actually reached disk.
+    """
+    global _LAST_SAVE_ERROR
     try:
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        parent = os.path.dirname(CONFIG_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
             json.dump(_CONFIG, f, indent=2)
+        _LAST_SAVE_ERROR = None
+        return True
     except Exception as e:  # noqa: BLE001
-        print("config save failed:", e, flush=True)
+        _LAST_SAVE_ERROR = str(e)
+        print(f"config save FAILED ({CONFIG_FILE}): {e}", flush=True)
+        return False
 
 
 def _cfg(key, default=None):
@@ -106,6 +123,17 @@ def _cfg(key, default=None):
 
 
 _load_config()
+
+print(
+    f"config: {CONFIG_FILE} ({len(_CONFIG)} keys) | token: {TOKEN_FILE} | img: {IMG_DIR}",
+    flush=True,
+)
+if CONFIG_FILE.startswith("/app/"):
+    print(
+        "WARNING: config lives inside the container image and is lost on every "
+        "add-on update; point CONFIG_FILE at a persistent volume",
+        flush=True,
+    )
 
 
 CONFIG_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
@@ -1064,7 +1092,8 @@ def make_handler(state: TVState):
                 snap["power"] = _effective_power(snap)
                 self._send(200, json.dumps(snap).encode("utf-8"), "application/json")
             elif self.path.startswith("/img/"):
-                import os, re as _re
+                import re as _re  # os is imported at module level; a local import here
+                # would shadow it for the whole function (UnboundLocalError above)
                 name = self.path.split("/img/", 1)[1].split("?")[0]
                 if not _re.match(r"^[A-Za-z0-9_.\-]+$", name):
                     name = "cat.png"
@@ -1098,6 +1127,11 @@ def make_handler(state: TVState):
                 red = {k: v for k, v in _CONFIG.items() if k != "ha_token"}
                 red["ha_token_set"] = bool(_CONFIG.get("ha_token"))
                 red["lan_ip"] = _lan_ip()
+                # Where the config actually lives, and whether it is on disk.
+                red["config_file"] = CONFIG_FILE
+                red["persisted"] = os.path.exists(CONFIG_FILE)
+                if _LAST_SAVE_ERROR:
+                    red["save_error"] = _LAST_SAVE_ERROR
                 self._send(200, json.dumps(red).encode("utf-8"), "application/json")
             elif self.path == "/config":
                 self._send(200, CONFIG_HTML.encode("utf-8"), "text/html; charset=utf-8")
@@ -1116,7 +1150,6 @@ def make_handler(state: TVState):
                     res["requester_ip"] = None
                 self._send(200, json.dumps(res).encode("utf-8"), "application/json")
             elif self.path == "/app.wgt":
-                import os
                 try:
                     with open(APP_WGT, "rb") as f:
                         data = f.read()
@@ -1176,8 +1209,24 @@ def make_handler(state: TVState):
                         _CONFIG["auto_load"] = bool(body["auto_load"])
                     if body.get("ha_token"):
                         _CONFIG["ha_token"] = body["ha_token"]
-                    _save_config()
-                    self._send(200, json.dumps({"ok": True}).encode("utf-8"), "application/json")
+                    if not _save_config():
+                        self._send(
+                            500,
+                            json.dumps(
+                                {
+                                    "error": "config could not be written to disk",
+                                    "config_file": CONFIG_FILE,
+                                    "detail": _LAST_SAVE_ERROR,
+                                }
+                            ).encode("utf-8"),
+                            "application/json",
+                        )
+                        return
+                    self._send(
+                        200,
+                        json.dumps({"ok": True, "config_file": CONFIG_FILE, "persisted": True}).encode("utf-8"),
+                        "application/json",
+                    )
                 except Exception as e:  # noqa: BLE001
                     self._send(400, json.dumps({"error": str(e)}).encode("utf-8"), "application/json")
                 return

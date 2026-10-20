@@ -10,11 +10,14 @@ COPY reader.py run.sh app.wgt /app/
 COPY img/ /app/img/
 RUN chmod a+x /app/run.sh
 
-# Persist config/token/images under /share so they survive add-on updates
-# (the add-on's /data can be reset on update/reinstall; /share is mapped and stable).
-ENV CONFIG_FILE=/share/yast-bridge/config.json \
-    TV_TOKEN_FILE=/share/yast-bridge/tv_token \
-    IMG_DIR=/share/yast-bridge/img \
+# Persist config/token/images under /data — the add-on's own volume, which
+# survives updates and rebuilds (it is only removed on uninstall). /share is
+# SMB-exported, so the HA long-lived token must NOT be stored there.
+# NOTE: HA's s6-overlay base sweeps the environment, so run.sh re-imports these
+# with with-contenv; see run.sh for details.
+ENV CONFIG_FILE=/data/config.json \
+    TV_TOKEN_FILE=/data/tv_token \
+    IMG_DIR=/data/img \
     PYTHONUNBUFFERED=1
 
 CMD ["/app/run.sh"]
