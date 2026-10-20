@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 
@@ -132,6 +133,7 @@ class LaunchRoutingTest(BridgeTest):
     def test_launch_agent_closes_before_launching(self):
         order = []
         self.mod.control_close_app = lambda app_id: order.append(("close", app_id)) or True
+        self.mod.app_state = lambda app_id: {"running": False}
         self.mod.control_launch_app = lambda app_id: order.append(("launch", app_id)) or True
         ok, err = self.mod.launch_agent()
         self.assertTrue(ok)
@@ -139,11 +141,38 @@ class LaunchRoutingTest(BridgeTest):
         self.assertEqual(order, [("close", self.mod.DEFAULT_AGENT_APP),
                                  ("launch", self.mod.DEFAULT_AGENT_APP)])
 
+    def test_launch_agent_waits_for_the_close_to_land(self):
+        """DELETE is async: launching too early gets the fresh instance killed."""
+        order, states = [], [True, True, False]
+        self.mod.control_close_app = lambda app_id: order.append("close") or True
+
+        def state(app_id):
+            return {"running": states.pop(0) if states else False}
+
+        self.mod.app_state = state
+        self.mod.control_launch_app = lambda app_id: order.append("launch") or True
+        self.mod.CLOSE_WAIT = 2.0
+        ok, _ = self.mod.launch_agent()
+        self.assertTrue(ok)
+        self.assertEqual(order, ["close", "launch"])
+
+    def test_launch_agent_launches_even_if_the_close_never_lands(self):
+        self.mod.control_close_app = lambda app_id: True
+        self.mod.app_state = lambda app_id: {"running": True}
+        self.mod.control_launch_app = lambda app_id: True
+        self.mod.CLOSE_WAIT = 0.3
+        start = time.time()
+        ok, err = self.mod.launch_agent()
+        self.assertTrue(ok, "the launch must not be skipped")
+        self.assertIsNone(err)
+        self.assertLess(time.time() - start, 2.0, "must respect CLOSE_WAIT, not hang")
+
     def test_launch_agent_survives_a_close_failure(self):
         def boom(app_id):
             raise RuntimeError("not running")
 
         self.mod.control_close_app = boom
+        self.mod.app_state = lambda app_id: {}
         self.mod.control_launch_app = lambda app_id: True
         ok, err = self.mod.launch_agent()
         self.assertTrue(ok, "a failed close must not stop the launch")
