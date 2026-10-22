@@ -712,7 +712,11 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                 power=get_power_state(),
                 error=str(e),
             )
-            for _ in range(6):
+            # ponytail: back off 60s instead of 3s. Every reconnect attempt makes the
+            # TV raise an "Allow this device?" dialog, so a 3s retry loop turns a
+            # standby set into a prompt storm. 60s keeps recovery usable while the
+            # set is asleep; lower it only if telemetry needs to be fresher on wake.
+            for _ in range(120):
                 if stop_event.is_set():
                     break
                 time.sleep(0.5)
