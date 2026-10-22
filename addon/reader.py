@@ -868,12 +868,23 @@ def _send_remote_key(key: str) -> bool:
             pass
 
 
-def control_power_off() -> bool:
+def control_power_off() -> dict:
     """Local power-off (to standby) via KEY_POWER over the remote-control WS.
-    Idempotent - no-op unless the TV is currently on, so the toggle never backfires."""
-    if _POWER_CACHE == "on":
-        return _send_remote_key("KEY_POWER")
-    return True
+
+    Returns what actually happened instead of a bare True. A cache miss used to look
+    identical to a successful send, which is how a dead power-off stayed invisible for
+    the caller. Still idempotent: KEY_POWER is a toggle, so standby/off is never sent
+    again, and an unknown power state is refused rather than guessed - guessing could
+    switch the TV ON."""
+    power = _POWER_CACHE
+    if power in ("standby", "off"):
+        return {"sent": False, "power": power, "reason": "already_off"}
+    if power != "on":
+        return {"sent": False, "power": power, "reason": "power_unknown"}
+    if not TV_TOKEN:
+        return {"sent": False, "power": power, "reason": "no_remote_token"}
+    _send_remote_key("KEY_POWER")
+    return {"sent": True, "power": power, "reason": None}
 
 
 # Server-side control actions. Everything the on-TV agent handles (volume, mute,
@@ -1637,6 +1648,15 @@ def make_handler(state: TVState):
                     res = CONTROL_ACTIONS[action](body)
                     if isinstance(res, str):
                         self._send(200, json.dumps({"ok": True, "token": res}).encode("utf-8"), "application/json")
+                    elif isinstance(res, dict):
+                        reason = res.get("reason")
+                        if reason in (None, "already_off"):
+                            status = 200
+                        elif reason == "no_remote_token":
+                            status = 503
+                        else:
+                            status = 409
+                        self._send(status, json.dumps({"ok": bool(res.get("sent")), **res}).encode("utf-8"), "application/json")
                     else:
                         self._send(200, json.dumps({"ok": bool(res)}).encode("utf-8"), "application/json")
                 else:
