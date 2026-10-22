@@ -15,6 +15,7 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -94,12 +95,25 @@ class TvReaderCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"bridge unreachable at {self._host}: {err}") from err
 
     async def control(self, action: str, **kwargs) -> dict:
-        """Forward a control action to POST /v1/control."""
+        """Forward a control action to POST /v1/control.
+
+        The bridge answers non-200 when a control did not happen (no remote token,
+        unknown power state). Raise instead of returning that body: a swallowed
+        failure is what made turn_off look successful while the TV stayed on.
+        """
         payload = {"action": action, **kwargs}
         async with self._session.post(
             f"{self._host}/v1/control", json=payload, timeout=_REQUEST_TIMEOUT
         ) as resp:
-            return await resp.json(content_type=None)
+            body = await resp.json(content_type=None)
+            if resp.status >= 400:
+                reason = ""
+                if isinstance(body, dict):
+                    reason = body.get("reason") or body.get("error") or ""
+                raise HomeAssistantError(
+                    f"bridge refused {action} (HTTP {resp.status}){': ' + str(reason) if reason else ''}"
+                )
+            return body
 
     async def notify(self, message: str) -> dict:
         """Show a toast/message on the TV via POST /v1/notify."""
