@@ -18,6 +18,7 @@ import os
 import sys
 import tempfile
 import threading
+import types
 import unittest
 import urllib.error
 import urllib.request
@@ -31,6 +32,16 @@ _ENV_KEYS = ("CONFIG_FILE", "TV_TOKEN_FILE", "IMG_DIR", "YAST_DATA_DIR", "DATA_D
 
 def load_reader(path=ADDON_READER, **env):
     """Import a fresh, independent copy of reader.py with the given environment."""
+    # reader.py imports `websocket` at module level; CI installs it, a stdlib-only box
+    # does not, and then every test here dies in exec_module. Never touch a real TV.
+    if "websocket" not in sys.modules:
+        stub = types.ModuleType("websocket")
+
+        def _no_ws(*_a, **_k):
+            raise RuntimeError("websocket disabled in tests")
+
+        stub.create_connection = _no_ws
+        sys.modules["websocket"] = stub
     for key in _ENV_KEYS:
         os.environ.pop(key, None)
     os.environ.update(env)

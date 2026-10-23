@@ -77,6 +77,14 @@ class PowerOffContract(unittest.TestCase):
         self.assertTrue(result["sent"])
         self.assertEqual(self.sent, ["KEY_POWER"])
 
+    def test_a_refused_power_off_key_is_reported(self):
+        """Same lie on the off path: a rejected key was reported as sent."""
+        self.m._send_remote_key = lambda key: False
+        self.m._POWER_CACHE = "on"
+        result = self.m.control_power_off()
+        self.assertEqual(result, {"sent": False, "power": "on", "reason": "send_failed"})
+        self.assertEqual(self.m._POWER_CACHE, "on", "a refused key changed no state")
+
     def test_deliberate_standby_survives_a_poller_write(self):
         """Review item 3: a poller inference must never undo a commanded power state.
 
@@ -97,6 +105,78 @@ class PowerOffContract(unittest.TestCase):
         self.assertTrue(url.startswith("wss://192.168.0.154:8002/"), url)
         self.assertIn("/api/v2/channels/samsung.remote.control?", url)
         self.assertIn("token=abc123", url)
+
+
+class PowerOnContract(unittest.TestCase):
+    """control_power_on had no guard: KEY_POWER is a blind toggle, so a stale cache
+    (or the no-op path) could switch a live TV off, and HA could not tell."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.sent = []
+        self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
+        self.m.TV_TOKEN = "token"
+
+    def test_sends_when_off(self):
+        self.m._POWER_CACHE = "standby"
+        self.assertEqual(
+            self.m.control_power_on(), {"sent": True, "power": "standby", "reason": None}
+        )
+        self.assertEqual(self.sent, ["KEY_POWER"])
+
+    def test_already_on_never_toggles(self):
+        self.m._POWER_CACHE = "on"
+        result = self.m.control_power_on()
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "already_on")
+        self.assertEqual(self.sent, [], "KEY_POWER would have switched the TV off")
+
+    def test_unknown_power_refused(self):
+        self.m._POWER_CACHE = None
+        result = self.m.control_power_on()
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "power_unknown")
+        self.assertEqual(self.sent, [])
+
+    def test_a_refused_send_is_not_reported_as_a_wake(self):
+        """_send_remote_key returns False on an explicit ms.error; ignoring it made a
+        rejected key read as a successful wake and poisoned the cache with 'on'."""
+        self.m._send_remote_key = lambda key: False
+        self.m._POWER_CACHE = "standby"
+        result = self.m.control_power_on()
+        self.assertEqual(result, {"sent": False, "power": "standby", "reason": "send_failed"})
+        self.assertEqual(self.m._POWER_CACHE, "standby", "a refused key changed no state")
+
+
+class StandbyPrimingTest(unittest.TestCase):
+    """P1-2: the WS poller's standby inference was computed and thrown away, so after a
+    turn_off + power loss the cache stayed None and turn_on refused as power_unknown.
+    The fix is a pure decision helper plus a _note_power() call - pinned here because
+    the poller loop itself needs a TV."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.sent = []
+        self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
+        self.m._POWER_CACHE = None
+
+    def test_rest_confirmed_standby_primes_the_cache(self):
+        self.m._note_power(self.m._ws_power_note(None, "standby"))
+        self.assertEqual(self.m._POWER_CACHE, "standby")
+        self.assertTrue(self.m.control_power_on()["sent"], "turn_on must fire after priming")
+        self.assertEqual(self.sent, ["KEY_POWER"])
+
+    def test_a_visible_app_still_means_on(self):
+        self.m._note_power(self.m._ws_power_note({"appId": "x", "visible": True}, "standby"))
+        self.assertEqual(self.m._POWER_CACHE, "on")
+
+    def test_no_inference_without_solid_evidence(self):
+        # a hidden running app proves nothing, and REST 'on' may only confirm on
+        self.assertIsNone(
+            self.m._ws_power_note({"appId": "x", "running": True, "visible": False}, None)
+        )
+        self.assertIsNone(self.m._ws_power_note(None, "on"))
+        self.assertIsNone(self.m._ws_power_note(None, None))
 
 
 if __name__ == "__main__":

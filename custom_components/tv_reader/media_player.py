@@ -300,20 +300,11 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
     async def async_turn_on(self) -> None:
         # Local: KEY_POWER over the TV's remote WS wakes it from network-standby
         # (verified twice on this set, 2026-10-23). No cloud: SmartThings is retired
-        # and is not in this path. `power_delegate` is a legacy optional hook and is
-        # unset on this install. No post-command recheck — that raced the local wake
+        # and is not in this path. No post-command recheck — that raced the local wake
         # and toggled the set back off.
-        ok = False
-        try:
-            res = await self.coordinator.control("power_on")
-            ok = isinstance(res, dict) and res.get("ok")
-        except Exception:  # bridge timeout/unreachable -> treat as failed, fall back
-            ok = False
-        delegate = self.coordinator.power_delegate
-        if not ok and delegate:
-            await self.hass.services.async_call(
-                "media_player", "turn_on", {"entity_id": delegate}, blocking=False
-            )
+        # control() raises on a refusal (power_unknown / send_failed), so reaching the
+        # refresh means a key really went out.
+        await self.coordinator.control("power_on")
         await self.coordinator.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
