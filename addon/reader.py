@@ -880,7 +880,8 @@ def control_power_on() -> dict:
 
     Answers what actually happened, like control_power_off: a bare True made "no key
     sent because we thought it was already on" indistinguishable from a real wake.
-    'sent' means the frame left the bridge - the TV never acks a keypress."""
+    'sent' means the frame left the bridge - the TV never acks a keypress, so a
+    silent socket still reads as sent; only an explicit ms.error is a send_failed."""
     power = _POWER_CACHE
     if power == "on":
         return {"sent": False, "power": power, "reason": "already_on"}
@@ -888,7 +889,10 @@ def control_power_on() -> dict:
     # would switch it ON-to-OFF or OFF-to-ON with equal confidence. Refuse instead.
     if power not in ("standby", "off"):
         return {"sent": False, "power": power, "reason": "power_unknown"}
-    _send_remote_key("KEY_POWER")
+    if _send_remote_key("KEY_POWER") is False:
+        # _send_remote_key is the only place an ms.error refusal is visible; ignoring
+        # it reported a wake that the TV had just rejected.
+        return {"sent": False, "power": power, "reason": "send_failed"}
     _note_power("on", deliberate=True)
     return {"sent": True, "power": power, "reason": None}
 
@@ -1015,7 +1019,8 @@ def control_power_off() -> dict:
         return {"sent": False, "power": power, "reason": "power_unknown"}
     # No token guard here on purpose: the first unpaired press is how the TV is asked
     # for permission, and _send_remote_key adopts the token it returns.
-    _send_remote_key("KEY_POWER")
+    if _send_remote_key("KEY_POWER") is False:
+        return {"sent": False, "power": power, "reason": "send_failed"}
     # deliberate: locks the cache so the poller cannot snap it back to "on" and
     # let a second turn_off flip the set back on
     _note_power("standby", deliberate=True)
@@ -1862,8 +1867,8 @@ def make_handler(state: TVState):
                         self._send(200, json.dumps({"ok": True, "token": res}).encode("utf-8"), "application/json")
                     elif isinstance(res, dict):
                         reason = res.get("reason")
-                        # only an explicit refusal is an error; already_on/off are 200
-                        status = 409 if reason == "power_unknown" else 200
+                        # an explicit refusal is an error; already_on/off are 200
+                        status = 409 if reason in ("power_unknown", "send_failed") else 200
                         self._send(status, json.dumps({"ok": bool(res.get("sent")), **res}).encode("utf-8"), "application/json")
                     else:
                         self._send(200, json.dumps({"ok": bool(res)}).encode("utf-8"), "application/json")

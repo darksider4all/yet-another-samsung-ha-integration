@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.request
 
@@ -24,6 +25,17 @@ _counter = [0]
 
 
 def load_reader(**env):
+    # reader.py imports `websocket` at module level. CI pip-installs it, a dev box with
+    # only stdlib does not have it, so every module-loading test died in exec_module
+    # before this stub. Never talk to a real TV from a test.
+    if "websocket" not in sys.modules:
+        stub = types.ModuleType("websocket")
+
+        def _no_ws(*_a, **_k):
+            raise RuntimeError("websocket disabled in tests")
+
+        stub.create_connection = _no_ws
+        sys.modules["websocket"] = stub
     for k in _ENV_KEYS:
         os.environ.pop(k, None)
     os.environ.update({k: v for k, v in env.items() if v is not None})
@@ -229,6 +241,33 @@ class PowerOnHttpTest(BridgeTest):
         self.assertEqual(status, 200)
         self.assertFalse(body["ok"], "nothing was sent, so ok must not claim it was")
         self.assertEqual(body["reason"], "already_on")
+
+    def test_a_key_that_really_went_out_is_ok_true(self):
+        """The success path, end to end: standby + a real send must read as success.
+        Both HTTP tests above cover refusals only, so 'ok' could be False for ever."""
+        self.mod.TV_TOKEN = "token"
+        self.mod._POWER_CACHE = "standby"
+        self.mod._send_remote_key = lambda key: True
+        status, body = self.post("/v1/control", {"action": "power_on"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["sent"])
+        self.assertIsNone(body["reason"])
+
+    def test_a_refused_key_is_409_not_a_claimed_wake(self):
+        """_send_remote_key's ms.error detection had no consumer in the power path."""
+        self.mod.TV_TOKEN = "token"
+        self.mod._POWER_CACHE = "standby"
+        self.mod._send_remote_key = lambda key: False
+        from urllib.error import HTTPError
+
+        with self.assertRaises(HTTPError) as ctx:
+            self.post("/v1/control", {"action": "power_on"})
+        self.assertEqual(ctx.exception.code, 409)
+        body = json.loads(ctx.exception.read().decode() or "{}")
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["reason"], "send_failed")
+        self.assertEqual(self.mod._POWER_CACHE, "standby", "a refused key changed no state")
 
 
 if __name__ == "__main__":

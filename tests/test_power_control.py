@@ -77,6 +77,14 @@ class PowerOffContract(unittest.TestCase):
         self.assertTrue(result["sent"])
         self.assertEqual(self.sent, ["KEY_POWER"])
 
+    def test_a_refused_power_off_key_is_reported(self):
+        """Same lie on the off path: a rejected key was reported as sent."""
+        self.m._send_remote_key = lambda key: False
+        self.m._POWER_CACHE = "on"
+        result = self.m.control_power_off()
+        self.assertEqual(result, {"sent": False, "power": "on", "reason": "send_failed"})
+        self.assertEqual(self.m._POWER_CACHE, "on", "a refused key changed no state")
+
     def test_deliberate_standby_survives_a_poller_write(self):
         """Review item 3: a poller inference must never undo a commanded power state.
 
@@ -129,6 +137,15 @@ class PowerOnContract(unittest.TestCase):
         self.assertFalse(result["sent"])
         self.assertEqual(result["reason"], "power_unknown")
         self.assertEqual(self.sent, [])
+
+    def test_a_refused_send_is_not_reported_as_a_wake(self):
+        """_send_remote_key returns False on an explicit ms.error; ignoring it made a
+        rejected key read as a successful wake and poisoned the cache with 'on'."""
+        self.m._send_remote_key = lambda key: False
+        self.m._POWER_CACHE = "standby"
+        result = self.m.control_power_on()
+        self.assertEqual(result, {"sent": False, "power": "standby", "reason": "send_failed"})
+        self.assertEqual(self.m._POWER_CACHE, "standby", "a refused key changed no state")
 
 
 class StandbyPrimingTest(unittest.TestCase):
