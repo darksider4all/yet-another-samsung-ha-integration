@@ -1534,6 +1534,13 @@ def make_handler(state: TVState):
             if self.path == "/v1/state":
                 snap = state.snapshot()
                 snap["agent"] = _AGENT.snapshot()
+                # The agent goes quiet while a real app is foreground, and older HA
+                # entities read only agent.foregroundApp. Fill it from the live WS poll
+                # so the entity can name the app (and pick its artwork) either way.
+                if not snap["agent"].get("foregroundApp"):
+                    _ra = snap.get("running_app") or {}
+                    if _ra.get("appId"):
+                        snap["agent"]["foregroundApp"] = _ra["appId"]
                 snap["power"] = _effective_power(snap)
                 self._send(200, json.dumps(snap).encode("utf-8"), "application/json")
             elif self.path.startswith("/img/"):

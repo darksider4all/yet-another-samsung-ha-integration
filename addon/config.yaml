@@ -1,5 +1,5 @@
 name: Yet Another Samsung Thing - Bridge
-version: "1.0.24"
+version: "1.0.25"
 slug: tv_reader_bridge
 description: Local bridge between the Samsung TV app and Home Assistant (telemetry, control, lights, toast/cast).
 url: https://github.com/darksider4all/yet-another-samsung-ha-integration
