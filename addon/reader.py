@@ -602,7 +602,9 @@ def _effective_power(snap):
     ag = snap.get("agent") or {}
     fg = ag.get("foregroundApp")
     fg_on = isinstance(fg, str) and bool(fg) and not fg.startswith("err")
-    if ra.get("visible") or ra.get("running") or fg_on:
+    # `running` is deliberately not evidence of anything: a backgrounded app stays
+    # running=true, which is how a stale YouTube reading got reported as "the app".
+    if ra.get("visible") or fg_on:
         return "on"
     if (time.time() - _POWER_INTENT_TS) < POWER_INTENT_GRACE and _POWER_CACHE in ("standby", "off"):
         return _POWER_CACHE          # we just switched it off; trust that over a stale poll
@@ -760,11 +762,11 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                     if app_info["visible"]:
                         running_app = app_info
 
-                if running_app is None:
-                    for app_info in installed:
-                        if app_info["running"]:
-                            running_app = app_info
-                            break
+                # Do NOT fall back to "running" here. A backgrounded app keeps
+                # running=true after another app takes the screen, so this fallback
+                # reported a stale app as the current one — it made the Casa watchdog
+                # read YouTube (111299001912) right after a relaunch and announce a
+                # restore failure that had not happened. Only `visible` is the screen.
 
                 power = get_power_state()
                 if not power and running_app and running_app.get("visible"):
