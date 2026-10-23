@@ -5,6 +5,14 @@ Without it the TV treats each reconnect as a new client and pops an
 """
 import os
 import sys
+import types
+
+# reader.py imports websocket at module level; stub it so this stays a plain
+# stdlib check that runs anywhere (no network, no image).
+if "websocket" not in sys.modules:
+    _ws = types.ModuleType("websocket")
+    _ws.create_connection = lambda *a, **k: None
+    sys.modules["websocket"] = _ws
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server", "bridge"))
 import reader  # noqa: E402
