@@ -649,7 +649,10 @@ def poller_loop(state: TVState, stop_event: threading.Event):
         # foreground telemetry over /v1/report — this WS adds nothing, and every
         # reconnect makes the TV demand a fresh "Allow this device?". That retry loop
         # is what turned one command into a stack of dialogs. Poll only as a fallback.
-        if (_AGENT.snapshot() or {}).get("online"):
+        if (_AGENT.snapshot() or {}).get("online") or not TV_TOKEN:
+            # ponytail: no token means every reconnect raises an Allow dialog, so wait
+            # quietly instead of polling. Pairing (POST /v1/control {action:pair}) is
+            # the only thing that should ask the TV for permission.
             _snap = state.snapshot()
             state.update(_snap["installed_apps"], _snap["running_app"], power=get_power_state())
             for _ in range(POLL_INTERVAL * 2):
@@ -840,25 +843,19 @@ def _remote_url(token=""):
     return f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v2/channels/samsung.remote.control?{q}"
 
 
-def control_pair(timeout=35) -> str:
-    """One-time pairing: connect to the remote-control channel with no token; the TV
-    shows an Allow dialog. On approval the TV returns a token in ms.channel.connect.
-    Persist and return it (cloud-free replacement for SmartThings pairing)."""
+def control_pair(timeout=45) -> str:
+    """Pair (or re-pair) from scratch: drop any stored token first, then connect with
+    none so the TV shows an Allow dialog. On approval the connect frame carries a
+    token, which is persisted. Clearing first matters — a stale token is refused
+    outright (1005) and the TV never gets as far as asking."""
     global TV_TOKEN
-    ws = websocket.create_connection(
-        _remote_url(""), timeout=timeout, sslopt={"cert_reqs": ssl.CERT_NONE}
-    )
+    _clear_token()
+    ws = _open_remote_channel(timeout)
     try:
-        ws.settimeout(timeout)
-        while True:
-            msg = json.loads(ws.recv())
-            if msg.get("event") == "ms.channel.connect":
-                tok = (msg.get("data") or {}).get("token")
-                if tok:
-                    TV_TOKEN = str(tok)
-                    _save_token(TV_TOKEN)
-                    return TV_TOKEN
-                raise RuntimeError(f"connected but no token: {msg}")
+        tok = TV_TOKEN
+        if not tok:
+            raise RuntimeError("connected but no token")
+        return tok
     finally:
         try:
             ws.close()
@@ -866,32 +863,57 @@ def control_pair(timeout=35) -> str:
             pass
 
 
-def _send_remote_key(key: str) -> bool:
-    """Send one remote key over the remote-control channel.
+def _clear_token():
+    """Forget the stored pairing token: the TV refuses it, so stop presenting it."""
+    global TV_TOKEN
+    TV_TOKEN = ""
+    try:
+        os.remove(TOKEN_FILE)
+    except Exception:
+        pass
 
-    Deliberately connects even with no token: the TV then shows its Allow dialog, and
-    on approval the connect frame carries a token we adopt and persist. That turns a
-    silent 'pair first' refusal into one prompt for life — the old guard made every
-    unpaired key press a fresh prompt instead.
+
+def _open_remote_channel(wait_s: int):
+    """Connect and wait for ms.channel.connect, adopting any token the TV hands back.
+
+    wait_s must cover a human answering an on-screen Allowed dialog on the first
+    pairing — 6s was why a token was never captured: the socket died before Allow.
     """
     global TV_TOKEN
     ws = websocket.create_connection(
-        _remote_url(TV_TOKEN), timeout=6, sslopt={"cert_reqs": ssl.CERT_NONE}
+        _remote_url(TV_TOKEN), timeout=wait_s, sslopt={"cert_reqs": ssl.CERT_NONE}
     )
+    ws.settimeout(wait_s)
+    # The remote channel broadcasts connect/disconnect events for ALL clients
+    # (e.g. samsungtv_smart). Read until OUR ms.channel.connect, ignoring others.
+    for _ in range(12):
+        msg = json.loads(ws.recv())
+        if msg.get("event") == "ms.channel.connect":
+            tok = (msg.get("data") or {}).get("token")
+            if tok and str(tok) != TV_TOKEN:
+                TV_TOKEN = str(tok)
+                _save_token(TV_TOKEN)
+            return ws
+    raise RuntimeError("no ms.channel.connect on remote channel")
+
+
+def _send_remote_key(key: str) -> bool:
+    """Send one remote key, self-healing a stale token.
+
+    If the stored token is refused, forget it and reconnect without one: the TV then
+    asks once, and the token it returns is saved. That converts 'rejected token →
+    prompt forever' into 'rejected token → one prompt → works'.
+    """
+    global TV_TOKEN
+    had_token = bool(TV_TOKEN)
     try:
-        ws.settimeout(6)
-        # The remote channel broadcasts connect/disconnect events for ALL clients
-        # (e.g. samsungtv_smart). Read until OUR ms.channel.connect, ignoring others.
-        for _ in range(12):
-            msg = json.loads(ws.recv())
-            if msg.get("event") == "ms.channel.connect":
-                tok = (msg.get("data") or {}).get("token")
-                if tok and str(tok) != TV_TOKEN:
-                    TV_TOKEN = str(tok)
-                    _save_token(TV_TOKEN)
-                break
-        else:
-            raise RuntimeError("no ms.channel.connect on remote channel")
+        ws = _open_remote_channel(8 if had_token else 45)
+    except Exception:
+        if not had_token:
+            raise
+        _clear_token()
+        ws = _open_remote_channel(45)
+    try:
         ws.send(json.dumps({
             "method": "ms.remote.control",
             "params": {"Cmd": "Click", "DataOfCmd": key,
@@ -1241,6 +1263,15 @@ CONTROL_ACTIONS = {
     "power_on": lambda b: control_power_on(),
     "power_off": lambda b: control_power_off(),
     "pair": lambda b: control_pair(),
+    # wipe the stored token so the next pair starts clean (a stale token is refused
+    # with 1005 and the TV never gets as far as showing its Allow dialog)
+    "forget_pairing": lambda b: (_clear_token(), {"ok": True, "token": ""})[1],
+    "pairing_status": lambda b: {
+        "has_token": bool(TV_TOKEN),
+        "token_len": len(TV_TOKEN or ""),
+        "token_file": TOKEN_FILE,
+        "client_name": CLIENT_NAME,
+    },
     "send_key": lambda b: _send_remote_key(b["key"]),
 }
 
