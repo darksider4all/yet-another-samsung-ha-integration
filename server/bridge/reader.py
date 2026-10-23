@@ -649,7 +649,14 @@ def poller_loop(state: TVState, stop_event: threading.Event):
         # foreground telemetry over /v1/report — this WS adds nothing, and every
         # reconnect makes the TV demand a fresh "Allow this device?". That retry loop
         # is what turned one command into a stack of dialogs. Poll only as a fallback.
-        if (_AGENT.snapshot() or {}).get("online") or not TV_TOKEN:
+        # ponytail: also stay off the TV while it is asleep. A standby set refuses the
+        # handshake and raises an Allow dialog per attempt, so polling it costs the
+        # user a screenful of prompts (9 observed) across one wake cycle.
+        if (
+            (_AGENT.snapshot() or {}).get("online")
+            or not TV_TOKEN
+            or _POWER_CACHE in ("standby", "off")
+        ):
             # ponytail: no token means every reconnect raises an Allow dialog, so wait
             # quietly instead of polling. Pairing (POST /v1/control {action:pair}) is
             # the only thing that should ask the TV for permission.
@@ -833,7 +840,10 @@ def control_power_on() -> bool:
     *fully* powered-off TV won't answer; the HA layer falls back to SmartThings then."""
     if _POWER_CACHE == "on":
         return True
-    return _send_remote_key("KEY_POWER")
+    ok = _send_remote_key("KEY_POWER")
+    if ok:
+        _note_power("on")
+    return ok
 
 
 def _remote_url(token=""):
@@ -944,6 +954,8 @@ def control_power_off() -> dict:
     # No token guard here on purpose: the first unpaired press is how the TV is asked
     # for permission, and _send_remote_key adopts the token it returns.
     _send_remote_key("KEY_POWER")
+    # flip the cache immediately: the poller stops touching the TV while it is asleep
+    _note_power("standby")
     return {"sent": True, "power": power, "reason": None}
 
 
