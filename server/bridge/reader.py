@@ -1457,6 +1457,32 @@ def _note_request(path):
 # Power on/off is NOT available locally on this TV (remotepower is NotSupported,
 # WoL doesn't wake Wi-Fi, remote-WS keys don't register) - the HA integration does
 # power via the samsungtv_smart/SmartThings delegate instead.
+# Commands after which the HA card is guaranteed to be stale: force a refresh.
+STATE_CHANGING_ACTIONS = {"launch_app", "close_app", "tune_channel", "power_on", "power_off"}
+
+
+def _poke_ha_state():
+    """Ask HA to re-read the bridge now instead of waiting for its scan interval.
+
+    Cheap one-shot POST to homeassistant.update_entity; failures are ignored because
+    the scheduled scan still picks the change up eventually.
+    """
+    url, tok = _ha_conf()
+    if not (url and tok):
+        return
+    try:
+        entity = _cfg("ha_entity", "") or os.environ.get("HA_TV_ENTITY", "media_player.samsung_tv")
+        req = urllib.request.Request(
+            f"{url}/api/services/homeassistant/update_entity",
+            data=json.dumps({"entity_id": entity}).encode("utf-8"),
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception:
+        pass
+
+
 AGENT_ACTIONS = {"volume_up", "volume_down", "set_volume", "mute",
                  "channel_up", "channel_down", "tune_channel", "notify", "hide"}
 # launch_app is deliberately NOT an agent action: a hidden Tizen app has its
@@ -1806,10 +1832,17 @@ def make_handler(state: TVState):
                 if action in AGENT_ACTIONS:
                     # Reliable path: hand to the on-TV agent (executes via Tizen APIs)
                     enqueue_command(body)
+                    # Force HA to re-read the bridge right after a state-changing
+                    # command, so the card does not sit on the old app/channel until the
+                    # next scheduled scan (scan_interval is the dominant lag).
+                    if action in STATE_CHANGING_ACTIONS:
+                        threading.Thread(target=_poke_ha_state, daemon=True).start()
                     online = _AGENT.snapshot().get("online")
                     self._send(200, json.dumps({"ok": True, "queued": True, "agent_online": bool(online)}).encode("utf-8"), "application/json")
                 elif action in CONTROL_ACTIONS:
                     res = CONTROL_ACTIONS[action](body)
+                    if action in STATE_CHANGING_ACTIONS:
+                        threading.Thread(target=_poke_ha_state, daemon=True).start()
                     if isinstance(res, str):
                         self._send(200, json.dumps({"ok": True, "token": res}).encode("utf-8"), "application/json")
                     elif isinstance(res, dict):
