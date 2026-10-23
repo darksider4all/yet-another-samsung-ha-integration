@@ -45,7 +45,7 @@ TV_PORT = 8002
 REST_PORT = 8001
 CLIENT_NAME = "yast-bridge"
 HTTP_PORT = 8777
-POLL_INTERVAL = 4  # seconds between full probe cycles
+POLL_INTERVAL = 2  # seconds between probe cycles (was 4: card lagged ~7s after an app change)
 # Persistent storage. The add-on's /data volume survives updates and rebuilds;
 # a path inside the image (/app/...) is wiped every time the container is
 # recreated, which silently loses the wizard config and the TV pairing token.
