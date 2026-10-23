@@ -613,6 +613,22 @@ def _effective_power(snap):
         return "standby"
     return _POWER_CACHE or "off"
 
+
+def _ws_power_note(running_app, power):
+    """Which power inference the WS poller may record, or None to record nothing.
+
+    Same rules as the agent branch: a visible app means on; the only other solid
+    signal is REST confirming standby/off while nothing is running. Returned rather
+    than written so the loop's decision is testable without a TV (it used to compute
+    'on' and throw it away, leaving the cache empty for control_power_on to refuse).
+    """
+    if running_app and running_app.get("visible"):
+        return "on"
+    if running_app is None and power in ("standby", "off"):
+        return "standby"
+    return None
+
+
 def get_power_state() -> str | None:
     """Read PowerState from the REST device info (local, no auth). Caches the last
     non-empty value; returns None on failure/empty so callers keep the last good one."""
@@ -753,10 +769,9 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                 power = get_power_state()
                 if not power and running_app and running_app.get("visible"):
                     power = "on"  # REST blanked PowerState but an app is visibly running
-                # Only live evidence may move the cache; REST is carried in the snapshot
-                # for display and for a confirm-on check, never written here.
-                if running_app and running_app.get("visible"):
-                    _note_power("on")
+                # Only live evidence may move the cache (see _ws_power_note); REST is
+                # carried in the snapshot for display, never written on its own.
+                _note_power(_ws_power_note(running_app, power))
                 state.update(installed, running_app, power=power)
 
                 for _ in range(POLL_INTERVAL * 2):
@@ -857,20 +872,25 @@ def control_wol() -> bool:
     return True
 
 
-def control_power_on() -> bool:
+def control_power_on() -> dict:
     """Local power-on: in network-standby the TV's remote-control WS still answers,
-    and KEY_POWER toggles it back on (verified). Idempotent - no-op if already on. A
-    *fully* powered-off TV won't answer; the HA layer falls back to SmartThings then."""
-    if _POWER_CACHE == "on":
-        return True
+    and KEY_POWER toggles it back on (verified). Idempotent - no key is sent when we
+    already know the set is on. A *fully* powered-off TV won't answer; the HA layer
+    falls back to its delegate then.
+
+    Answers what actually happened, like control_power_off: a bare True made "no key
+    sent because we thought it was already on" indistinguishable from a real wake.
+    'sent' means the frame left the bridge - the TV never acks a keypress."""
+    power = _POWER_CACHE
+    if power == "on":
+        return {"sent": False, "power": power, "reason": "already_on"}
     # KEY_POWER is a blind toggle: if we are not *sure* the set is off, sending it
     # would switch it ON-to-OFF or OFF-to-ON with equal confidence. Refuse instead.
-    if _POWER_CACHE not in ("standby", "off"):
-        return False
-    ok = _send_remote_key("KEY_POWER")
-    if ok:
-        _note_power("on", deliberate=True)
-    return ok
+    if power not in ("standby", "off"):
+        return {"sent": False, "power": power, "reason": "power_unknown"}
+    _send_remote_key("KEY_POWER")
+    _note_power("on", deliberate=True)
+    return {"sent": True, "power": power, "reason": None}
 
 
 def _remote_url(token=""):
@@ -959,7 +979,19 @@ def _send_remote_key(key: str) -> bool:
             "params": {"Cmd": "Click", "DataOfCmd": key,
                        "Option": "false", "TypeOfRemote": "SendRemoteKey"},
         }))
-        time.sleep(0.4)
+        # Silence is the normal answer - the TV never acks a keypress - so only an
+        # explicit ms.error counts as a refusal. Without this check a refused key was
+        # reported as sent (hence 'ok' on a TV that never woke). A lost key still
+        # reads as sent: this proves delivery to the socket, not that the TV acted.
+        ws.settimeout(0.4)
+        deadline = time.time() + 0.4
+        while time.time() < deadline:
+            try:
+                msg = json.loads(ws.recv())
+            except Exception:
+                break
+            if isinstance(msg, dict) and msg.get("event") == "ms.error":
+                return False
         return True
     finally:
         try:
@@ -1541,7 +1573,10 @@ def make_handler(state: TVState):
                 # The agent goes quiet while a real app is foreground, and older HA
                 # entities read only agent.foregroundApp. Fill it from the live WS poll
                 # so the entity can name the app (and pick its artwork) either way.
-                if not snap["agent"].get("foregroundApp"):
+                # Only when the agent is NOT reporting: a live report is fresher than
+                # our last WS poll, and backfilling over it is how the card kept showing
+                # the previous app after a switch.
+                if not snap["agent"].get("online") and not snap["agent"].get("foregroundApp"):
                     _ra = snap.get("running_app") or {}
                     if _ra.get("appId"):
                         snap["agent"]["foregroundApp"] = _ra["appId"]
@@ -1827,10 +1862,8 @@ def make_handler(state: TVState):
                         self._send(200, json.dumps({"ok": True, "token": res}).encode("utf-8"), "application/json")
                     elif isinstance(res, dict):
                         reason = res.get("reason")
-                        if reason in (None, "already_off"):
-                            status = 200
-                        else:
-                            status = 409   # power_unknown: refused rather than guessed
+                        # only an explicit refusal is an error; already_on/off are 200
+                        status = 409 if reason == "power_unknown" else 200
                         self._send(status, json.dumps({"ok": bool(res.get("sent")), **res}).encode("utf-8"), "application/json")
                     else:
                         self._send(200, json.dumps({"ok": bool(res)}).encode("utf-8"), "application/json")

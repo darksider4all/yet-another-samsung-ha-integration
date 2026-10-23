@@ -210,5 +210,26 @@ class NotifyLaunchesAgentTest(BridgeTest):
         self.assertTrue(diag["toast_pending"])
 
 
+class PowerOnHttpTest(BridgeTest):
+    """Over HTTP: a turn_on the bridge refuses must be a refusal, not a 200 that HA
+    reads as success. power_on used to answer `ok: true` for every call."""
+
+    def test_unknown_power_is_refused_with_409(self):
+        from urllib.error import HTTPError
+
+        with self.assertRaises(HTTPError) as ctx:
+            self.post("/v1/control", {"action": "power_on"})
+        self.assertEqual(ctx.exception.code, 409)
+        body = json.loads(ctx.exception.read().decode() or "{}")
+        self.assertEqual(body["reason"], "power_unknown")
+
+    def test_already_on_is_200_and_sends_no_key(self):
+        self.mod._POWER_CACHE = "on"
+        status, body = self.post("/v1/control", {"action": "power_on"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["ok"], "nothing was sent, so ok must not claim it was")
+        self.assertEqual(body["reason"], "already_on")
+
+
 if __name__ == "__main__":
     unittest.main()

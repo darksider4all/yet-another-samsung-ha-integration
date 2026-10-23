@@ -303,10 +303,13 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         # and is not in this path. `power_delegate` is a legacy optional hook and is
         # unset on this install. No post-command recheck — that raced the local wake
         # and toggled the set back off.
+        # The bridge answers {sent, power, reason}; control() already raises on a
+        # refusal. 'sent' is the only thing that means "a key really went out" -
+        # `ok` was true even for already_on, so a no-op read as a successful wake.
         ok = False
         try:
             res = await self.coordinator.control("power_on")
-            ok = isinstance(res, dict) and res.get("ok")
+            ok = isinstance(res, dict) and bool(res.get("sent"))
         except Exception:  # bridge timeout/unreachable -> treat as failed, fall back
             ok = False
         delegate = self.coordinator.power_delegate
