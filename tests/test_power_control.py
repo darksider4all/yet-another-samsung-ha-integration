@@ -99,5 +99,26 @@ class PowerOffContract(unittest.TestCase):
         self.assertIn("token=abc123", url)
 
 
+class ConnectBudget(unittest.TestCase):
+    """A retry loop must not be able to turn itself into a dialog storm."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.m._CONNECT_TIMES[:] = []
+
+    def test_budget_stops_a_storm(self):
+        self.m.CONNECT_BUDGET = 3
+        for _ in range(3):
+            self.m._connect_allowed()
+        with self.assertRaises(RuntimeError):
+            self.m._connect_allowed()
+
+    def test_budget_window_expires(self):
+        self.m.CONNECT_BUDGET = 1
+        self.m._connect_allowed()
+        self.m._CONNECT_TIMES[:] = [0.0]        # long ago
+        self.m._connect_allowed()               # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -909,6 +909,28 @@ def _clear_token():
             pass
 
 
+_CONNECT_TIMES = []            # timestamps of remote-channel connections
+CONNECT_BUDGET = 12            # max such connections per CONNECT_WINDOW
+CONNECT_WINDOW = 3600.0        # seconds
+
+
+def _connect_allowed():
+    """Hard circuit breaker: a burst of connections is what makes the TV ask again.
+
+    Whatever the cause of a retry loop, the bridge can now add at most CONNECT_BUDGET
+    dialogs an hour — a guardrail, not a fix. Reset by restarting the add-on.
+    """
+    now = time.time()
+    _CONNECT_TIMES[:] = [t for t in _CONNECT_TIMES if now - t < CONNECT_WINDOW]
+    if len(_CONNECT_TIMES) >= CONNECT_BUDGET:
+        raise RuntimeError(
+            f"refusing to connect: {len(_CONNECT_TIMES)} remote-channel connections in "
+            f"the last {int(CONNECT_WINDOW/60)} min (budget {CONNECT_BUDGET}). "
+            "Check for a retry loop before restarting the bridge."
+        )
+    _CONNECT_TIMES.append(now)
+
+
 def _open_remote_channel(wait_s: int):
     """Connect and wait for ms.channel.connect, adopting any token the TV hands back.
 
@@ -916,6 +938,7 @@ def _open_remote_channel(wait_s: int):
     pairing — 6s was why a token was never captured: the socket died before Allow.
     """
     global TV_TOKEN
+    _connect_allowed()          # circuit breaker: never storm the TV with dialogs
     ws = websocket.create_connection(
         _remote_url(TV_TOKEN), timeout=wait_s, sslopt={"cert_reqs": ssl.CERT_NONE}
     )
