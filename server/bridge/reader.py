@@ -1461,12 +1461,11 @@ def _note_request(path):
 STATE_CHANGING_ACTIONS = {"launch_app", "close_app", "tune_channel", "power_on", "power_off"}
 
 
-def _poke_ha_state():
-    """Ask HA to re-read the bridge now instead of waiting for its scan interval.
-
-    Cheap one-shot POST to homeassistant.update_entity; failures are ignored because
-    the scheduled scan still picks the change up eventually.
-    """
+def _poke_ha_state(delay: float = 0.0):
+    """Ask HA to re-read the bridge now (and again shortly after, because the TV
+    takes a second or two to actually switch app/channel after the command)."""
+    if delay:
+        time.sleep(delay)
     url, tok = _ha_conf()
     if not (url and tok):
         return
@@ -1836,13 +1835,15 @@ def make_handler(state: TVState):
                     # command, so the card does not sit on the old app/channel until the
                     # next scheduled scan (scan_interval is the dominant lag).
                     if action in STATE_CHANGING_ACTIONS:
-                        threading.Thread(target=_poke_ha_state, daemon=True).start()
+                        for _d in (0.0, 2.5):
+                            threading.Thread(target=_poke_ha_state, args=(_d,), daemon=True).start()
                     online = _AGENT.snapshot().get("online")
                     self._send(200, json.dumps({"ok": True, "queued": True, "agent_online": bool(online)}).encode("utf-8"), "application/json")
                 elif action in CONTROL_ACTIONS:
                     res = CONTROL_ACTIONS[action](body)
                     if action in STATE_CHANGING_ACTIONS:
-                        threading.Thread(target=_poke_ha_state, daemon=True).start()
+                        for _d in (0.0, 2.5):
+                            threading.Thread(target=_poke_ha_state, args=(_d,), daemon=True).start()
                     if isinstance(res, str):
                         self._send(200, json.dumps({"ok": True, "token": res}).encode("utf-8"), "application/json")
                     elif isinstance(res, dict):
