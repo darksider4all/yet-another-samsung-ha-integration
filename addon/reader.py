@@ -643,9 +643,16 @@ def poller_loop(state: TVState, stop_event: threading.Event):
     """Background thread: keep a WS connection to the app-control channel
     and repeatedly cycle through CANDIDATE_APP_IDS with ms.application.get.
     """
-    url = f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v2?name={_b64(CLIENT_NAME)}"
     while not stop_event.is_set():
         ws = None
+        # ponytail: present the stored token here too, and recompute each cycle so a
+        # token learned mid-run is used. Without it the TV treats every reconnect as a
+        # brand-new client and pops an "Allow this device?" dialog, so a paired bridge
+        # still asked for permission on each poll cycle.
+        _q = f"name={_b64(CLIENT_NAME)}"
+        if TV_TOKEN:
+            _q += f"&token={TV_TOKEN}"
+        url = f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v2?{_q}"
         try:
             ws = websocket.create_connection(
                 url, timeout=8, sslopt={"cert_reqs": ssl.CERT_NONE}
@@ -654,6 +661,12 @@ def poller_loop(state: TVState, stop_event: threading.Event):
             first = json.loads(ws.recv())
             if first.get("event") != "ms.channel.connect":
                 raise RuntimeError(f"unexpected handshake reply: {first}")
+            # Adopt the token the TV hands back after an Allow, so the next cycle
+            # authenticates silently instead of prompting again.
+            _tok = (first.get("data") or {}).get("token")
+            if _tok and str(_tok) != TV_TOKEN:
+                globals()["TV_TOKEN"] = str(_tok)
+                _save_token(str(_tok))
 
             while not stop_event.is_set():
                 installed = []
@@ -842,9 +855,14 @@ def control_pair(timeout=35) -> str:
 
 
 def _send_remote_key(key: str) -> bool:
-    """Send one remote key over the paired remote-control channel."""
-    if not TV_TOKEN:
-        raise RuntimeError("no remote token - pair first (POST /v1/control {action:pair})")
+    """Send one remote key over the remote-control channel.
+
+    Deliberately connects even with no token: the TV then shows its Allow dialog, and
+    on approval the connect frame carries a token we adopt and persist. That turns a
+    silent 'pair first' refusal into one prompt for life — the old guard made every
+    unpaired key press a fresh prompt instead.
+    """
+    global TV_TOKEN
     ws = websocket.create_connection(
         _remote_url(TV_TOKEN), timeout=6, sslopt={"cert_reqs": ssl.CERT_NONE}
     )
@@ -855,6 +873,10 @@ def _send_remote_key(key: str) -> bool:
         for _ in range(12):
             msg = json.loads(ws.recv())
             if msg.get("event") == "ms.channel.connect":
+                tok = (msg.get("data") or {}).get("token")
+                if tok and str(tok) != TV_TOKEN:
+                    TV_TOKEN = str(tok)
+                    _save_token(TV_TOKEN)
                 break
         else:
             raise RuntimeError("no ms.channel.connect on remote channel")
@@ -885,8 +907,8 @@ def control_power_off() -> dict:
         return {"sent": False, "power": power, "reason": "already_off"}
     if power != "on":
         return {"sent": False, "power": power, "reason": "power_unknown"}
-    if not TV_TOKEN:
-        return {"sent": False, "power": power, "reason": "no_remote_token"}
+    # No token guard here on purpose: the first unpaired press is how the TV is asked
+    # for permission, and _send_remote_key adopts the token it returns.
     _send_remote_key("KEY_POWER")
     return {"sent": True, "power": power, "reason": None}
 
