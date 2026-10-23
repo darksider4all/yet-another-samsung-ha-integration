@@ -645,6 +645,18 @@ def poller_loop(state: TVState, stop_event: threading.Event):
     """
     while not stop_event.is_set():
         ws = None
+        # ponytail: while the on-TV agent is reporting, it already delivers app and
+        # foreground telemetry over /v1/report — this WS adds nothing, and every
+        # reconnect makes the TV demand a fresh "Allow this device?". That retry loop
+        # is what turned one command into a stack of dialogs. Poll only as a fallback.
+        if (_AGENT.snapshot() or {}).get("online"):
+            _snap = state.snapshot()
+            state.update(_snap["installed_apps"], _snap["running_app"], power=get_power_state())
+            for _ in range(POLL_INTERVAL * 2):
+                if stop_event.is_set():
+                    break
+                time.sleep(0.5)
+            continue
         # ponytail: present the stored token here too, and recompute each cycle so a
         # token learned mid-run is used. Without it the TV treats every reconnect as a
         # brand-new client and pops an "Allow this device?" dialog, so a paired bridge
@@ -1522,6 +1534,13 @@ def make_handler(state: TVState):
                     "toast_pending": bool(_toast["data"]) and (now - _toast["ts"]) < TOAST_TTL,
                     "launch_mode": _LAUNCH_MODE,
                     "requests": reqs,
+                    # pairing truth, so a prompt storm can be diagnosed without ssh
+                    "pairing": {
+                        "has_token": bool(TV_TOKEN),
+                        "token_len": len(TV_TOKEN or ""),
+                        "token_file": TOKEN_FILE,
+                        "client_name": CLIENT_NAME,
+                    },
                 }
                 self._send(200, json.dumps(payload).encode("utf-8"), "application/json")
             else:
