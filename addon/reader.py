@@ -591,28 +591,27 @@ def _note_power(p, deliberate=False):
 
 
 def _effective_power(snap):
-    """Robust on/standby from all signals, since this TV's REST PowerState is often
-    blank. Priority: REST value -> a visibly-running app or a real agent foreground
-    app -> agent alive but nothing foreground means screen off (standby). Feeds the
-    toggle cache so KEY_POWER goes the right way."""
-    p = snap.get("power")
-    if p in ("on", "standby", "off"):
-        eff = p
-    else:
-        ra = snap.get("running_app") or {}
-        ag = snap.get("agent") or {}
-        fg = ag.get("foregroundApp")
-        fg_on = isinstance(fg, str) and fg and not fg.startswith("err")
-        if ra.get("visible") or fg_on:
-            eff = "on"
-        elif ag.get("online") or ra or snap.get("installed_apps"):
-            eff = "standby"   # reachable but nothing on screen -> screen off
-        else:
-            eff = "off"       # nothing reachable -> fully powered off
-    # read path: never writes the cache. Letting it do so is what undid a deliberate
-    # power-off within one poll cycle.
-    return eff
+    """What the TV is doing, for display and for the card's on/off state.
 
+    Live evidence beats everything: a visible/running app or a real agent foreground
+    app means the screen is on. REST PowerState is the weakest signal on this model
+    (it reports 'standby' while the set is lit), so it may only *confirm* on, never
+    veto it. A deliberate power command holds its value for POWER_INTENT_GRACE.
+    """
+    ra = snap.get("running_app") or {}
+    ag = snap.get("agent") or {}
+    fg = ag.get("foregroundApp")
+    fg_on = isinstance(fg, str) and bool(fg) and not fg.startswith("err")
+    if ra.get("visible") or ra.get("running") or fg_on:
+        return "on"
+    if (time.time() - _POWER_INTENT_TS) < POWER_INTENT_GRACE and _POWER_CACHE in ("standby", "off"):
+        return _POWER_CACHE          # we just switched it off; trust that over a stale poll
+    p = snap.get("power")
+    if p == "on":
+        return "on"
+    if ag.get("online") or ra.get("appId") or snap.get("installed_apps"):
+        return "standby"
+    return _POWER_CACHE or "off"
 
 def get_power_state() -> str | None:
     """Read PowerState from the REST device info (local, no auth). Caches the last
@@ -669,11 +668,11 @@ def poller_loop(state: TVState, stop_event: threading.Event):
         # ponytail: also stay off the TV while it is asleep. A standby set refuses the
         # handshake and raises an Allow dialog per attempt, so polling it costs the
         # user a screenful of prompts (9 observed) across one wake cycle.
-        if (
-            (_AGENT.snapshot() or {}).get("online")
-            or not TV_TOKEN
-            or _POWER_CACHE in ("standby", "off")
-        ):
+        # NOTE: do not gate on _POWER_CACHE here. A wrong cache entry (REST said
+        # 'standby' while the set was lit) used to stop the poller for good, so the
+        # card stayed blank and 'off' with nothing to disprove it. Only solid signals
+        # may stop the poller: the on-TV agent reporting, or no pairing token.
+        if (_AGENT.snapshot() or {}).get("online") or not TV_TOKEN:
             # ponytail: no token means every reconnect raises an Allow dialog, so wait
             # quietly instead of polling. Pairing (POST /v1/control {action:pair}) is
             # the only thing that should ask the TV for permission.
