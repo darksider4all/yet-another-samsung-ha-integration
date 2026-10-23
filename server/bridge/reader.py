@@ -486,6 +486,12 @@ AGENT_STALE_SECONDS = int(os.environ.get("AGENT_STALE_SECONDS", "75"))   # offli
 # Candidate Tizen appIds to probe for presence/running-state.
 # Verified against this TV: 111299001912 (YouTube), 3201910019365 (Prime Video),
 # 3201512006963 (Plex), 3201606009684 (Spotify), 3201901017640 (Disney+).
+APP_ID_ALIASES = {
+    # agent-reported id : Tizen numeric id the WS poll reports with a display name
+    "org.tizen.netflix-app": "3201907018807",
+    "com.samsung.tv.cobalt-yt": "111299001912",
+}
+
 CANDIDATE_APP_IDS = [
     "org.tizen.browser",       # Internet
     "111299001912",            # YouTube (verified on this TV)
@@ -1587,6 +1593,26 @@ def make_handler(state: TVState):
                     _ra = snap.get("running_app") or {}
                     if _ra.get("appId"):
                         snap["agent"]["foregroundApp"] = _ra["appId"]
+                # The HA entity names an app by looking its id up in agent.apps (a
+                # catalog of {id,name}). The agent leaves that empty, so the card showed
+                # raw ids like org.tizen.netflix-app. Fill it from the WS poll, which
+                # already carries the TV's own display names.
+                # The agent reports some apps under a package-style id while the WS
+                # poll knows them by Tizen's numeric id with a display name
+                # (org.tizen.netflix-app vs 3201907018807). Translate so the card can
+                # name the app instead of showing a package id.
+                # ponytail: a short explicit map; extend it when a new mismatch shows up.
+                _fgv = snap["agent"].get("foregroundApp")
+                if isinstance(_fgv, str) and _fgv in APP_ID_ALIASES:
+                    snap["agent"]["foregroundApp"] = APP_ID_ALIASES[_fgv]
+                if not snap["agent"].get("apps"):
+                    _cat = [
+                        {"id": a.get("appId"), "name": a.get("name")}
+                        for a in (snap.get("installed_apps") or [])
+                        if a.get("appId") and a.get("name")
+                    ]
+                    if _cat:
+                        snap["agent"]["apps"] = _cat
                 snap["power"] = _effective_power(snap)
                 self._send(200, json.dumps(snap).encode("utf-8"), "application/json")
             elif self.path.startswith("/img/"):
