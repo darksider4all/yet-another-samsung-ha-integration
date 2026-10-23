@@ -681,10 +681,10 @@ def poller_loop(state: TVState, stop_event: threading.Event):
             # foreground means the screen is off. REST must never decide the cache.
             _ag = (_AGENT.snapshot() or {})
             _fg = _ag.get("foregroundApp")
-            _hint = (
-                "on" if (isinstance(_fg, str) and _fg and not _fg.startswith("err"))
-                else ("standby" if _ag.get("online") else None)
-            )
+            _hint = "on" if (isinstance(_fg, str) and _fg and not _fg.startswith("err")) else None
+            if _hint is None and _ag.get("online") and get_power_state() in ("standby", "off"):
+                # agent alive + no foreground app, *confirmed* by REST: screen is off
+                _hint = "standby"
             _note_power(_hint)
             _snap = state.snapshot()
             state.update(_snap["installed_apps"], _snap["running_app"], power=_hint)
@@ -753,7 +753,10 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                 power = get_power_state()
                 if not power and running_app and running_app.get("visible"):
                     power = "on"  # REST blanked PowerState but an app is visibly running
-                _note_power(power)
+                # Only live evidence may move the cache; REST is carried in the snapshot
+                # for display and for a confirm-on check, never written here.
+                if running_app and running_app.get("visible"):
+                    _note_power("on")
                 state.update(installed, running_app, power=power)
 
                 for _ in range(POLL_INTERVAL * 2):
@@ -908,28 +911,6 @@ def _clear_token():
             pass
 
 
-_CONNECT_TIMES = []            # timestamps of remote-channel connections
-CONNECT_BUDGET = 12            # max such connections per CONNECT_WINDOW
-CONNECT_WINDOW = 3600.0        # seconds
-
-
-def _connect_allowed():
-    """Hard circuit breaker: a burst of connections is what makes the TV ask again.
-
-    Whatever the cause of a retry loop, the bridge can now add at most CONNECT_BUDGET
-    dialogs an hour — a guardrail, not a fix. Reset by restarting the add-on.
-    """
-    now = time.time()
-    _CONNECT_TIMES[:] = [t for t in _CONNECT_TIMES if now - t < CONNECT_WINDOW]
-    if len(_CONNECT_TIMES) >= CONNECT_BUDGET:
-        raise RuntimeError(
-            f"refusing to connect: {len(_CONNECT_TIMES)} remote-channel connections in "
-            f"the last {int(CONNECT_WINDOW/60)} min (budget {CONNECT_BUDGET}). "
-            "Check for a retry loop before restarting the bridge."
-        )
-    _CONNECT_TIMES.append(now)
-
-
 def _open_remote_channel(wait_s: int):
     """Connect and wait for ms.channel.connect, adopting any token the TV hands back.
 
@@ -937,7 +918,6 @@ def _open_remote_channel(wait_s: int):
     pairing — 6s was why a token was never captured: the socket died before Allow.
     """
     global TV_TOKEN
-    _connect_allowed()          # circuit breaker: never storm the TV with dialogs
     ws = websocket.create_connection(
         _remote_url(TV_TOKEN), timeout=wait_s, sslopt={"cert_reqs": ssl.CERT_NONE}
     )
@@ -1453,9 +1433,9 @@ def _note_request(path):
         e = _diag.setdefault(p, {"count": 0, "last": 0.0})
         e["count"] += 1
         e["last"] = time.time()
-# Power on/off is NOT available locally on this TV (remotepower is NotSupported,
-# WoL doesn't wake Wi-Fi, remote-WS keys don't register) - the HA integration does
-# power via the samsungtv_smart/SmartThings delegate instead.
+# Power on/off IS local: KEY_POWER on wss://<tv>:8002/.../samsung.remote.control
+# with the paired token, verified both directions on this set (2026-10-23). No
+# SmartThings and no delegate in the path.
 # Commands after which the HA card is guaranteed to be stale: force a refresh.
 STATE_CHANGING_ACTIONS = {"launch_app", "close_app", "tune_channel", "power_on", "power_off"}
 
