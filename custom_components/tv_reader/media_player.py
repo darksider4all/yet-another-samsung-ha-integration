@@ -149,8 +149,19 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
 
     @property
     def _fg(self):
+        # Our own on-TV agent (AGENT_ID) overlays the foreground while it runs; it is
+        # never "the app" the viewer is watching, so never report it as one.
         fg = self._agent.get("foregroundApp")
-        return fg if isinstance(fg, str) else None
+        if not isinstance(fg, str) or fg == AGENT_ID:
+            fg = None
+        # The agent's last report can be hours stale (it goes quiet while an app is
+        # foreground). When it is not online, trust the bridge's live WS poll instead:
+        # that is the difference between reporting YouTube and reporting the daemon.
+        if not self._agent.get("online"):
+            ra = self._d.get("running_app") or {}
+            if ra.get("appId"):
+                return ra["appId"]
+        return fg
 
     @property
     def _is_live_tv(self) -> bool:

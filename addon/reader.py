@@ -1371,6 +1371,11 @@ class AgentState:
                       "system", "network", "sensors", "apps", "seq", "event", "hidden"):
                 if k in report and report[k] is not None:
                     self._d[k] = report[k]
+            # Our own agent reports itself as foreground whenever it is up. It is a
+            # daemon, not the app the viewer is watching: never surface it as one,
+            # otherwise HA shows "ChanProbe0.ChannelProbe" while YouTube is playing.
+            if self._d.get("foregroundApp") in (DEFAULT_AGENT_APP, "ChanProbe0.ChannelProbe"):
+                self._d["foregroundApp"] = None
             self._d["agent_ts"] = report.get("ts")
             self._d["last_seen"] = datetime.now(timezone.utc).isoformat()
 
@@ -1378,6 +1383,18 @@ class AgentState:
         with self._lock:
             d = dict(self._d)
         d["online"] = self._is_online(d.get("last_seen"))
+        # Channel/program belong to whatever the agent last saw. Once it has been quiet
+        # for minutes the viewer has almost certainly left live TV, so stop reporting a
+        # stale "PRO TV HD" next to a running app.
+        _ls = d.get("last_seen")
+        if _ls and not d["online"]:
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(_ls)).total_seconds()
+                if age > 300:
+                    d["channel"] = None
+                    d["program"] = None
+            except Exception:
+                pass
         # The on-TV agent can't read the MAC (privileged); fill the known value.
         net = d.get("network")
         if isinstance(net, dict):
