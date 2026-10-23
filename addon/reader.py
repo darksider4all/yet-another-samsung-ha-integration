@@ -464,13 +464,17 @@ def _load_token():
         return ""
 
 
+_TOKEN_LOCK = threading.RLock()
+
+
 def _save_token(tok):
-    try:
-        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
-        with open(TOKEN_FILE, "w") as f:
-            f.write(tok or "")
-    except Exception as e:
-        print("token save failed:", e, flush=True)
+    with _TOKEN_LOCK:
+        try:
+            os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+            with open(TOKEN_FILE, "w") as f:
+                f.write(tok or "")
+        except Exception as e:
+            print("token save failed:", e, flush=True)
 
 
 TV_TOKEN = _load_token()  # remote-channel pairing token (env or persisted file)
@@ -564,10 +568,26 @@ _POWER_CACHE = None  # last known-good PowerState ("on"/"standby"); power reads 
 _DEVICE_CACHE = {"ip": None, "device": None, "ts": 0.0}  # last good /api/v2 device block from the poller
 
 
-def _note_power(p):
-    global _POWER_CACHE
-    if p:
-        _POWER_CACHE = p
+_POWER_INTENT_TS = 0.0          # when a *deliberate* power command set the cache
+POWER_INTENT_GRACE = 30.0       # seconds during which pollers may not overwrite it
+
+
+def _note_power(p, deliberate=False):
+    """One writer for the power cache.
+
+    KEY_POWER is a blind toggle, so the cache must reflect what we last *did*, not
+    what a stale REST field remembers. A deliberate power command therefore locks the
+    value for POWER_INTENT_GRACE seconds against poller writes; before this, the next
+    poll cycle snapped 'standby' back to 'on' and a second turn_off flipped the TV on.
+    """
+    global _POWER_CACHE, _POWER_INTENT_TS
+    if not p:
+        return
+    if not deliberate and (time.time() - _POWER_INTENT_TS) < POWER_INTENT_GRACE:
+        return  # a real command is more trustworthy than an inference
+    _POWER_CACHE = p
+    if deliberate:
+        _POWER_INTENT_TS = time.time()
 
 
 def _effective_power(snap):
@@ -589,7 +609,8 @@ def _effective_power(snap):
             eff = "standby"   # reachable but nothing on screen -> screen off
         else:
             eff = "off"       # nothing reachable -> fully powered off
-    _note_power(eff)
+    # read path: never writes the cache. Letting it do so is what undid a deliberate
+    # power-off within one poll cycle.
     return eff
 
 
@@ -667,13 +688,10 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                     break
                 time.sleep(0.5)
             continue
-        # ponytail: present the stored token here too, and recompute each cycle so a
-        # token learned mid-run is used. Without it the TV treats every reconnect as a
-        # brand-new client and pops an "Allow this device?" dialog, so a paired bridge
-        # still asked for permission on each poll cycle.
+        # The app-control channel takes no token (only the remote-control channel on
+        # the SSL port does). Sending one here was wrong: it made the TV treat the
+        # poller as a different client than the paired one.
         _q = f"name={_b64(CLIENT_NAME)}"
-        if TV_TOKEN:
-            _q += f"&token={TV_TOKEN}"
         url = f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v2?{_q}"
         try:
             ws = websocket.create_connection(
@@ -683,12 +701,9 @@ def poller_loop(state: TVState, stop_event: threading.Event):
             first = json.loads(ws.recv())
             if first.get("event") != "ms.channel.connect":
                 raise RuntimeError(f"unexpected handshake reply: {first}")
-            # Adopt the token the TV hands back after an Allow, so the next cycle
-            # authenticates silently instead of prompting again.
-            _tok = (first.get("data") or {}).get("token")
-            if _tok and str(_tok) != TV_TOKEN:
-                globals()["TV_TOKEN"] = str(_tok)
-                _save_token(str(_tok))
+            # No token adoption here: the app-control channel has its own identity and
+            # its token is not the remote-control token. Mixing them was a race and a
+            # correctness bug (review item 2).
 
             while not stop_event.is_set():
                 installed = []
@@ -842,7 +857,7 @@ def control_power_on() -> bool:
         return True
     ok = _send_remote_key("KEY_POWER")
     if ok:
-        _note_power("on")
+        _note_power("on", deliberate=True)
     return ok
 
 
@@ -876,11 +891,12 @@ def control_pair(timeout=45) -> str:
 def _clear_token():
     """Forget the stored pairing token: the TV refuses it, so stop presenting it."""
     global TV_TOKEN
-    TV_TOKEN = ""
-    try:
-        os.remove(TOKEN_FILE)
-    except Exception:
-        pass
+    with _TOKEN_LOCK:
+        TV_TOKEN = ""
+        try:
+            os.remove(TOKEN_FILE)
+        except Exception:
+            pass
 
 
 def _open_remote_channel(wait_s: int):
@@ -900,9 +916,11 @@ def _open_remote_channel(wait_s: int):
         msg = json.loads(ws.recv())
         if msg.get("event") == "ms.channel.connect":
             tok = (msg.get("data") or {}).get("token")
-            if tok and str(tok) != TV_TOKEN:
-                TV_TOKEN = str(tok)
-                _save_token(TV_TOKEN)
+            if tok:
+                with _TOKEN_LOCK:            # read-modify-write under one lock
+                    if str(tok) != TV_TOKEN:
+                        TV_TOKEN = str(tok)
+                        _save_token(TV_TOKEN)
             return ws
     raise RuntimeError("no ms.channel.connect on remote channel")
 
@@ -954,8 +972,9 @@ def control_power_off() -> dict:
     # No token guard here on purpose: the first unpaired press is how the TV is asked
     # for permission, and _send_remote_key adopts the token it returns.
     _send_remote_key("KEY_POWER")
-    # flip the cache immediately: the poller stops touching the TV while it is asleep
-    _note_power("standby")
+    # deliberate: locks the cache so the poller cannot snap it back to "on" and
+    # let a second turn_off flip the set back on
+    _note_power("standby", deliberate=True)
     return {"sent": True, "power": power, "reason": None}
 
 
@@ -1740,10 +1759,8 @@ def make_handler(state: TVState):
                         reason = res.get("reason")
                         if reason in (None, "already_off"):
                             status = 200
-                        elif reason == "no_remote_token":
-                            status = 503
                         else:
-                            status = 409
+                            status = 409   # power_unknown: refused rather than guessed
                         self._send(status, json.dumps({"ok": bool(res.get("sent")), **res}).encode("utf-8"), "application/json")
                     else:
                         self._send(200, json.dumps({"ok": bool(res)}).encode("utf-8"), "application/json")

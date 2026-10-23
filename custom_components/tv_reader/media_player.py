@@ -278,15 +278,20 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
 
     async def async_turn_off(self) -> None:
         # Local, cloud-free: KEY_POWER over the TV's own remote-control WS (via the
-        # bridge). Replaces the samsungtv_smart/SmartThings off path.
-        await self.coordinator.control("power_off")
+        # bridge). No SmartThings in this path. The bridge answers
+        # {sent, power, reason}; refresh afterwards so HA shows the state it caused
+        # instead of the stale one it predicted.
+        try:
+            await self.coordinator.control("power_off")
+        finally:
+            await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self) -> None:
-        # Local-first: KEY_POWER over the TV's remote WS wakes it from network-standby
-        # (the normal "off" state - verified). The bridge returns ok=False only if the
-        # WS was unreachable (TV *fully* powered off); fall back to SmartThings then
-        # (until retired; an IR blaster / CEC replaces that fallback later). No post-
-        # command recheck - that raced the local wake and toggled it back off.
+        # Local: KEY_POWER over the TV's remote WS wakes it from network-standby
+        # (verified twice on this set, 2026-10-23). No cloud: SmartThings is retired
+        # and is not in this path. `power_delegate` is a legacy optional hook and is
+        # unset on this install. No post-command recheck — that raced the local wake
+        # and toggled the set back off.
         ok = False
         try:
             res = await self.coordinator.control("power_on")

@@ -67,13 +67,36 @@ class PowerOffContract(unittest.TestCase):
         self.assertEqual(result["reason"], "power_unknown")
         self.assertEqual(self.sent, [], "guessing could switch the TV ON")
 
-    def test_missing_token_is_reported(self):
+    def test_missing_token_bootstraps_pairing(self):
+        """No token is not a refusal any more: the key path connects token-less so the
+        TV can ask once, then saves what it hands back. (The old 'no_remote_token'
+        branch was dead code and its test was red on main.)"""
         self.m._POWER_CACHE = "on"
         self.m.TV_TOKEN = ""
         result = self.m.control_power_off()
-        self.assertFalse(result["sent"])
-        self.assertEqual(result["reason"], "no_remote_token")
-        self.assertEqual(self.sent, [], "no token must not pretend to send")
+        self.assertTrue(result["sent"])
+        self.assertEqual(self.sent, ["KEY_POWER"])
+
+    def test_deliberate_standby_survives_a_poller_write(self):
+        """Review item 3: a poller inference must never undo a commanded power state.
+
+        Without this, the next poll snapped the cache back to 'on' and a second
+        turn_off re-fired the blind toggle and switched the TV ON.
+        """
+        self.m._POWER_CACHE = "on"
+        self.m.control_power_off()
+        self.assertEqual(self.m._POWER_CACHE, "standby")
+        self.m._note_power("on")            # what get_power_state() used to do
+        self.assertEqual(self.m._POWER_CACHE, "standby", "poller clobbered a command")
+
+    def test_remote_channel_wire_format(self):
+        """Pin port and path: the 1005 red herring was a wrong-port attempt (:8009)."""
+        self.m.CLIENT_NAME = "yast-bridge"
+        self.m._cfg = lambda k, d=None: "192.168.0.154" if k == "tv_ip" else d
+        url = self.m._remote_url("abc123")
+        self.assertTrue(url.startswith("wss://192.168.0.154:8002/"), url)
+        self.assertIn("/api/v2/channels/samsung.remote.control?", url)
+        self.assertIn("token=abc123", url)
 
 
 if __name__ == "__main__":
