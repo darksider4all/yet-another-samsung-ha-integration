@@ -617,16 +617,12 @@ def _effective_power(snap):
 def get_power_state() -> str | None:
     """Read PowerState from the REST device info (local, no auth). Caches the last
     non-empty value; returns None on failure/empty so callers keep the last good one."""
-    global _POWER_CACHE
     try:
         dev = json.loads(_rest_request(""))["device"]
         _DEVICE_CACHE.update(ip=_cfg("tv_ip", ""), device=dev, ts=time.time())
-        ps = dev.get("PowerState") or None
+        return dev.get("PowerState") or None
     except Exception:
-        ps = None
-    if ps:
-        _POWER_CACHE = ps
-    return ps
+        return None
 
 
 class TVState:
@@ -681,8 +677,18 @@ def poller_loop(state: TVState, stop_event: threading.Event):
             # ponytail: no token means every reconnect raises an Allow dialog, so wait
             # quietly instead of polling. Pairing (POST /v1/control {action:pair}) is
             # the only thing that should ask the TV for permission.
+            # Trust the on-TV agent over the TV's REST PowerState (which lies on this
+            # model): a real foreground app means on; agent alive with nothing
+            # foreground means the screen is off. REST must never decide the cache.
+            _ag = (_AGENT.snapshot() or {})
+            _fg = _ag.get("foregroundApp")
+            _hint = (
+                "on" if (isinstance(_fg, str) and _fg and not _fg.startswith("err"))
+                else ("standby" if _ag.get("online") else None)
+            )
+            _note_power(_hint)
             _snap = state.snapshot()
-            state.update(_snap["installed_apps"], _snap["running_app"], power=get_power_state())
+            state.update(_snap["installed_apps"], _snap["running_app"], power=_hint)
             for _ in range(POLL_INTERVAL * 2):
                 if stop_event.is_set():
                     break
@@ -855,6 +861,10 @@ def control_power_on() -> bool:
     *fully* powered-off TV won't answer; the HA layer falls back to SmartThings then."""
     if _POWER_CACHE == "on":
         return True
+    # KEY_POWER is a blind toggle: if we are not *sure* the set is off, sending it
+    # would switch it ON-to-OFF or OFF-to-ON with equal confidence. Refuse instead.
+    if _POWER_CACHE not in ("standby", "off"):
+        return False
     ok = _send_remote_key("KEY_POWER")
     if ok:
         _note_power("on", deliberate=True)
