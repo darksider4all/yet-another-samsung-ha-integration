@@ -1510,6 +1510,11 @@ class AgentState:
             # otherwise HA shows "ChanProbe0.ChannelProbe" while YouTube is playing.
             if self._d.get("foregroundApp") in (DEFAULT_AGENT_APP, "ChanProbe0.ChannelProbe"):
                 self._d["foregroundApp"] = None
+            # The agent reports "err: ..." when it cannot resolve the app (seen live:
+            # "err: AppID is null"), and the card rendered that as an app name.
+            _fg = self._d.get("foregroundApp")
+            if isinstance(_fg, str) and _fg.lower().startswith("err"):
+                self._d["foregroundApp"] = None
             self._d["agent_ts"] = report.get("ts")
             self._d["last_seen"] = datetime.now(timezone.utc).isoformat()
 

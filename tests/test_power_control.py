@@ -402,3 +402,21 @@ class FailedSendRestoresTheApp(unittest.TestCase):
         snap = self.state.snapshot()
         self.assertEqual((snap["running_app"] or {}).get("name"), "Netflix")
         self.assertEqual(snap["power"], "on")
+
+
+class AgentErrorIsNotAnApp(unittest.TestCase):
+    """Seen live: the card showed app_name "err: AppID is null"."""
+
+    def setUp(self):
+        self.m = _load_reader()
+
+    def test_err_foreground_is_dropped(self):
+        ag = self.m.AgentState()
+        ag.update_from_report({"source": "tv-agent", "foregroundApp": "err: AppID is null",
+                               "ts": 1})
+        self.assertIsNone(ag.snapshot().get("foregroundApp"))
+
+    def test_a_real_app_still_passes(self):
+        ag = self.m.AgentState()
+        ag.update_from_report({"source": "tv-agent", "foregroundApp": "111299001912", "ts": 1})
+        self.assertEqual(ag.snapshot().get("foregroundApp"), "111299001912")
