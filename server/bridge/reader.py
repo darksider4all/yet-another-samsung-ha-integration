@@ -944,6 +944,38 @@ def app_state(app_id: str) -> dict:
         return {}
 
 
+def _visible_app_now():
+    """The app on screen right now, straight from REST (None if nothing is visible)."""
+    _, running, _ = poll_apps()
+    return running
+
+
+def notify_with_restore(message, duration):
+    """Show a toast, then put the viewer back where they were.
+
+    A notification works by launching the on-TV agent, which means the app that was
+    playing stops being the foreground app. Nothing brought it back, so a toast during
+    YouTube left the set sitting on the agent's screen. Capture what was playing, and
+    relaunch it once the toast has expired — unless the viewer has since chosen
+    something else, in which case leave it alone.
+    """
+    prev = _visible_app_now()
+    set_toast({"message": str(message), "duration": duration})
+    launched, launch_error = launch_agent()
+    if launched and prev and prev.get("appId"):
+
+        def restore():
+            time.sleep(max(1, int(duration)) + 2)
+            now = _visible_app_now()
+            if now is None:          # the agent's splash is not in the app catalogue
+                try:
+                    control_launch_app(prev["appId"])
+                except Exception:
+                    pass
+        threading.Thread(target=restore, daemon=True).start()
+    return launched, launch_error
+
+
 def launch_agent() -> tuple:
     """Bring the on-TV agent to the foreground. Returns (ok, error).
 
@@ -1999,13 +2031,13 @@ def make_handler(state: TVState):
                     if not msg:
                         raise ValueError("missing 'message'")
                     duration = int(body.get("duration") or _cfg("notify_seconds", 8) or 8)
-                    set_toast({"message": str(msg), "duration": duration})
                     # A hidden Tizen app has its timers suspended, so it can never
                     # poll the command queue by itself: launch it. Its boot path
                     # fetches /v1/toast and paints the message. Only fall back to the
                     # queue when the launch fails, otherwise the queued `notify` would
                     # cause a second relaunch that wipes the toast it just showed.
-                    launched, launch_error = launch_agent()
+                    # notify_with_restore() also puts the previous app back afterwards.
+                    launched, launch_error = notify_with_restore(msg, duration)
                     if not launched:
                         enqueue_command({"action": "notify", "message": str(msg), "duration": duration})
                     online = _AGENT.snapshot().get("online")

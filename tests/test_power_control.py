@@ -504,3 +504,36 @@ class PowerStateLiteralContract(unittest.TestCase):
                           ("standby", "standby"), ("Off", "standby")):
             self.m.get_power_state = lambda r=raw: r
             self.assertEqual(self.m._read_power_now(), want, raw)
+
+
+class NotifyRestoresPreviousApp(unittest.TestCase):
+    """A toast launched the agent and never put the viewer back where they were."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.toasts, self.launched = [], []
+        self.m.set_toast = lambda p: self.toasts.append(p)
+        self.m.launch_agent = lambda: (self.launched.append(1), (True, None))[1]
+        self.m.control_launch_app = lambda app_id: self.launched.append(app_id)
+        self.prev = {"appId": "111299001912", "name": "YouTube", "visible": True}
+
+    def test_no_previous_app_means_no_restore(self):
+        self.m._visible_app_now = lambda: None
+        self.m.notify_with_restore("hi", 1)
+        self.assertEqual(self.launched, [1], "only the agent was launched")
+
+    def test_previous_app_is_relaunched_after_the_toast(self):
+        seq = [self.prev, None]          # before: YouTube; after the toast: agent showing
+        self.m._visible_app_now = lambda: seq.pop(0) if seq else None
+        self.m.notify_with_restore("hi", 1)
+        import time as _t
+        _t.sleep(3.5)
+        self.assertIn("111299001912", self.launched, "YouTube was never brought back")
+
+    def test_viewer_who_switched_apps_is_left_alone(self):
+        seq = [self.prev, {"appId": "3201907018807", "name": "Netflix", "visible": True}]
+        self.m._visible_app_now = lambda: seq.pop(0) if seq else None
+        self.m.notify_with_restore("hi", 1)
+        import time as _t
+        _t.sleep(3.5)
+        self.assertNotIn("111299001912", self.launched, "we fought the viewer")
