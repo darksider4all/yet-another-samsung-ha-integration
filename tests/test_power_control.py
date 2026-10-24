@@ -317,3 +317,45 @@ class StaleSnapshotContract(unittest.TestCase):
 
     def test_garbage_timestamp_is_stale(self):
         self.assertGreater(self.m._snapshot_age({"timestamp": "not-a-date"}), self.m.STALE_AFTER)
+
+
+class RestAppPollContract(unittest.TestCase):
+    """Telemetry over REST: the same answer as ms.application.get, no token, ~10 ms."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.m._cfg = lambda k, d=None: "192.168.0.154" if k == "tv_ip" else d
+
+    def test_visible_app_is_the_running_app(self):
+        def fake(path, method="GET"):
+            if "111299001912" in path:
+                return '{"id":"111299001912","name":"YouTube","running":true,"visible":true,"version":"2.1"}'
+            if "3201907018807" in path:
+                return '{"id":"3201907018807","name":"Netflix","running":true,"visible":false,"version":"80"}'
+            raise RuntimeError("404")
+        self.m._rest_request = fake
+        installed, running, err = self.m.poll_apps()
+        self.assertIsNone(err)
+        self.assertEqual(running["name"], "YouTube")
+        self.assertEqual([a["name"] for a in installed], ["YouTube", "Netflix"])
+
+    def test_backgrounded_app_is_not_the_running_app(self):
+        def fake(path, method="GET"):
+            return '{"id":"x","name":"Netflix","running":true,"visible":false}'
+        self.m._rest_request = fake
+        _, running, err = self.m.poll_apps()
+        self.assertIsNone(running, "running=true alone is not the screen")
+        self.assertIsNone(err)
+
+    def test_unreachable_tv_is_an_error_not_a_guess(self):
+        def fake(path, method="GET"):
+            raise RuntimeError("connection refused")
+        self.m._rest_request = fake
+        installed, running, err = self.m.poll_apps()
+        self.assertEqual(installed, [])
+        self.assertIsNone(running)
+        self.assertEqual(err, "rest unreachable")
+
+    def test_no_tv_ip_configured(self):
+        self.m._cfg = lambda k, d=None: d
+        self.assertEqual(self.m.poll_apps()[2], "no tv_ip configured")
