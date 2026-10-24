@@ -294,3 +294,26 @@ class PollerBackoffContract(unittest.TestCase):
     def test_refused_connect_still_waits_a_minute(self):
         # every failed connect can raise an "Allow this device?" dialog on the TV
         self.assertEqual(self.m._retry_delay(False), 60.0)
+
+
+class StaleSnapshotContract(unittest.TestCase):
+    """A frozen poll was replayed forever: the TV sat in standby while the card still
+    showed 'on, YouTube' 50 s later."""
+
+    def setUp(self):
+        self.m = _load_reader()
+
+    def test_no_timestamp_is_infinitely_stale(self):
+        self.assertGreater(self.m._snapshot_age({}), self.m.STALE_AFTER)
+
+    def test_fresh_snapshot_is_believed(self):
+        from datetime import datetime, timezone
+        snap = {"timestamp": datetime.now(timezone.utc).isoformat()}
+        self.assertLess(self.m._snapshot_age(snap), self.m.STALE_AFTER)
+
+    def test_old_snapshot_is_stale(self):
+        snap = {"timestamp": "2020-01-01T00:00:00+00:00"}
+        self.assertGreater(self.m._snapshot_age(snap), self.m.STALE_AFTER)
+
+    def test_garbage_timestamp_is_stale(self):
+        self.assertGreater(self.m._snapshot_age({"timestamp": "not-a-date"}), self.m.STALE_AFTER)
