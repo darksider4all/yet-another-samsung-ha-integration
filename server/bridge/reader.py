@@ -1031,11 +1031,19 @@ def control_power_on() -> dict:
         return {"sent": False, "power": power, "reason": "already_on", "verified": True}
     gen = bump_power_gen()
     if power is not None:                      # it answered: network standby
+        # A burst first even though the set answers. Two measured reasons (2026-10-24):
+        # REST can answer while the radio is half asleep, and a set in network standby
+        # can still refuse the key when the pairing went stale — the burst costs ~1.5 s
+        # and needs no token, so it is the cheap insurance the ordering was missing.
+        woke = _wake_on_lan(bursts=3, interval=0.5)
         if _send_remote_key("KEY_POWER") is False:
-            return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
+            # REST answered, so the set is reachable: a refused key is a pairing
+            # problem, not a dead TV. Say that, so HA can show something fixable
+            # instead of a silent miss ("send_failed" hid it).
+            return {"sent": False, "power": power, "reason": "needs_pairing", "verified": False}
         _arm_verify("on", gen=gen)
         return {"sent": True, "power": power, "reason": None, "verified": False,
-                "method": "key", "pending": True}
+                "method": "wol+key" if woke else "key", "pending": True}
     # No answer at all: deep standby. Only Wake-on-LAN reaches it, and it needs no token.
     if not _wake_on_lan():
         return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
@@ -2108,7 +2116,7 @@ def make_handler(state: TVState):
                     elif isinstance(res, dict):
                         reason = res.get("reason")
                         # an explicit refusal is an error; already_on/off are 200
-                        status = 409 if reason in ("power_unknown", "send_failed") else 200
+                        status = 409 if reason in ("power_unknown", "send_failed", "needs_pairing") else 200
                         self._send(status, json.dumps({"ok": bool(res.get("sent")), **res}).encode("utf-8"), "application/json")
                     else:
                         self._send(200, json.dumps({"ok": bool(res)}).encode("utf-8"), "application/json")

@@ -274,7 +274,8 @@ class PowerOnHttpTest(BridgeTest):
         self.assertEqual(ctx.exception.code, 409)
         body = json.loads(ctx.exception.read().decode() or "{}")
         self.assertFalse(body["ok"])
-        self.assertEqual(body["reason"], "send_failed")
+        # REST answered, so the refusal is the pairing, not the network (2026-10-24).
+        self.assertEqual(body["reason"], "needs_pairing")
         self.assertEqual(self.mod._POWER_CACHE, "standby", "a refused key changed no state")
 
 

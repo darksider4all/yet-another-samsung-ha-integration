@@ -156,12 +156,25 @@ class PowerOnContract(unittest.TestCase):
 
     def test_a_refused_send_is_not_reported_as_a_wake(self):
         """_send_remote_key returns False on an explicit ms.error; ignoring it made a
-        rejected key read as a successful wake and poisoned the cache with 'on'."""
+        rejected key read as a successful wake and poisoned the cache with 'on'.
+        REST answered, so the refusal is a pairing problem and says so (2026-10-24)."""
         self.m._send_remote_key = lambda key: False
         self.m._POWER_CACHE = "standby"
         result = self.m.control_power_on()
-        self.assertEqual(result, {"sent": False, "power": "standby", "reason": "send_failed", "verified": False})
+        self.assertEqual(result, {"sent": False, "power": "standby", "reason": "needs_pairing", "verified": False})
         self.assertEqual(self.m._POWER_CACHE, "standby", "a refused key changed no state")
+
+    def test_the_burst_goes_out_before_the_key(self):
+        """A set that answers REST can still refuse the key with a stale pairing, so the
+        (token-free, ~1.5 s) burst goes first — order is the whole point."""
+        order = []
+        self.m._wake_on_lan = lambda *a, **k: (order.append("wol"), True)[1]
+        self.m._send_remote_key = lambda key: (order.append("key"), True)[1]
+        self.m._POWER_CACHE = "standby"
+        result = self.m.control_power_on()
+        self.assertEqual(order, ["wol", "key"])
+        self.assertEqual(result["method"], "wol+key")
+        self.assertTrue(result["pending"])
 
 
 
@@ -235,10 +248,11 @@ class WakeOnLanContract(unittest.TestCase):
         self.assertTrue(result["pending"], "verification is deferred so HA does not time out")
         self.assertEqual(self.sent, [], "no key: the wake path must not need pairing")
 
-    def test_a_set_that_answers_is_woken_by_key(self):
+    def test_a_set_that_answers_is_woken_by_burst_then_key(self):
         self.m._read_power_now = lambda: "standby"
+        self.m._wake_on_lan = lambda *a, **k: True   # never a real packet from a test
         result = self.m.control_power_on()
-        self.assertEqual(result["method"], "key")
+        self.assertEqual(result["method"], "wol+key")
         self.assertEqual(self.sent, ["KEY_POWER"])
 
     def test_no_wol_and_no_answer_is_a_refusal(self):
