@@ -1668,6 +1668,15 @@ def make_handler(state: TVState):
                 # (org.tizen.netflix-app vs 3201907018807). Translate so the card can
                 # name the app instead of showing a package id.
                 # ponytail: a short explicit map; extend it when a new mismatch shows up.
+                # The REST poll is the authority on what is on screen. The agent's own
+                # foreground claim is not: on this set it reports its notification
+                # overlay ("com.samsung.tv.notification-app") while Prime Video plays,
+                # and any older entity reading agent.foregroundApp then shows a package
+                # id instead of the app. Trust the visible app and let the agent speak
+                # only when nothing is visible.
+                _ra_vis = snap.get("running_app") or {}
+                if _ra_vis.get("visible") and _ra_vis.get("appId"):
+                    snap["agent"]["foregroundApp"] = _ra_vis["appId"]
                 _fgv = snap["agent"].get("foregroundApp")
                 if isinstance(_fgv, str) and _fgv in APP_ID_ALIASES:
                     snap["agent"]["foregroundApp"] = APP_ID_ALIASES[_fgv]
