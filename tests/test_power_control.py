@@ -50,6 +50,8 @@ class PowerOffContract(unittest.TestCase):
         # unless the test says otherwise.
         self.m._read_power_now = lambda: self.m._POWER_CACHE
         self.m._verify_power = lambda want, tries=6, delay=0.7: True
+        # never put a real magic packet on the LAN from a test
+        self.m._wake_on_lan = lambda *a, **k: False
 
     def test_sends_when_on(self):
         self.m._POWER_CACHE = "on"
@@ -126,11 +128,13 @@ class PowerOnContract(unittest.TestCase):
         # unless the test says otherwise.
         self.m._read_power_now = lambda: self.m._POWER_CACHE
         self.m._verify_power = lambda want, tries=6, delay=0.7: True
+        # never put a real magic packet on the LAN from a test
+        self.m._wake_on_lan = lambda *a, **k: False
 
     def test_sends_when_off(self):
         self.m._POWER_CACHE = "standby"
         self.assertEqual(
-            self.m.control_power_on(), {"sent": True, "power": "standby", "reason": None, "verified": True}
+            self.m.control_power_on(), {"sent": True, "power": "standby", "reason": None, "verified": True, "method": "key"}
         )
         self.assertEqual(self.sent, ["KEY_POWER"])
 
@@ -203,6 +207,7 @@ class PowerTruthContract(unittest.TestCase):
         self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
         self.m.TV_TOKEN = "token"
         self.m._verify_power = lambda want, tries=6, delay=0.7: True
+        self.m._wake_on_lan = lambda *a, **k: False
 
     def test_stale_cache_standby_rest_on_sends_nothing(self):
         self.m._POWER_CACHE = "standby"
@@ -234,3 +239,44 @@ class PowerTruthContract(unittest.TestCase):
         self.m._read_power_now = lambda: None
         result = self.m.control_power_on()
         self.assertTrue(result["sent"])
+
+
+class WakeOnLanContract(unittest.TestCase):
+    """Measured 2026-10-24: in deep standby the DU85 answers no socket at all, and a
+    10-packet WoL burst woke it in ~3 s. WoL needs no pairing token, so it goes first."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.sent = []
+        self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
+        self.m.TV_TOKEN = "token"
+        self.m._POWER_CACHE = "standby"
+        self.m._read_power_now = lambda: "standby"
+
+    def test_wol_alone_wakes_without_using_the_token(self):
+        self.m._wake_on_lan = lambda *a, **k: True
+        self.m._verify_power = lambda want, tries=12, delay=1.0: True
+        result = self.m.control_power_on()
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["method"], "wol")
+        self.assertEqual(self.sent, [], "no key: the wake path must not need pairing")
+
+    def test_wol_then_key_when_the_set_is_only_in_standby(self):
+        self.m._wake_on_lan = lambda *a, **k: True
+        self.m._verify_power = lambda want, tries=12, delay=1.0: False
+        result = self.m.control_power_on()
+        self.assertEqual(result["method"], "wol+key")
+        self.assertEqual(self.sent, ["KEY_POWER"])
+
+    def test_neither_path_lands_is_reported_unverified(self):
+        self.m._wake_on_lan = lambda *a, **k: True
+        self.m._verify_power = lambda want, tries=12, delay=1.0: False
+        self.m._send_remote_key = lambda key: False
+        result = self.m.control_power_on()
+        self.assertTrue(result["sent"], "a packet did leave the host")
+        self.assertFalse(result["verified"])
+        self.assertEqual(self.m._POWER_CACHE, "standby", "an unverified wake must not lock the cache")
+
+    def test_no_mac_means_no_wol(self):
+        self.m._cfg = lambda k, d=None: "" if k == "tv_mac" else d
+        self.assertFalse(self.m._wake_on_lan(bursts=1, interval=0))
