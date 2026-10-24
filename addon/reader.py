@@ -622,6 +622,42 @@ def _effective_power(snap):
     return _POWER_CACHE or "off"
 
 
+def _wake_on_lan(bursts: int = 10, interval: float = 1.0) -> bool:
+    """Magic packet to the set, broadcast + unicast. Returns True if it was sent.
+
+    Measured 2026-10-24 on the DU85: after a real power-off the TV stops answering
+    :8001/:8002/:26101 entirely (deep standby) and only WoL brings it back — one
+    packet was not enough, a 10-packet burst over 10 s woke it in ~3 s. This is the
+    only wake path that does not need the pairing token, so it is tried first.
+    """
+    mac = (_cfg("tv_mac", "") or "").replace(":", "").replace("-", "").strip()
+    if len(mac) != 12:
+        return False
+    try:
+        pkt = b"\xff" * 6 + bytes.fromhex(mac) * 16
+    except ValueError:
+        return False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except OSError:
+        return False
+    try:
+        for i in range(max(1, bursts)):
+            for dst in ("255.255.255.255", _cfg("tv_ip", "")):
+                if not dst:
+                    continue
+                try:
+                    s.sendto(pkt, (dst, 9))
+                except OSError:
+                    pass
+            if i + 1 < bursts:
+                time.sleep(interval)
+        return True
+    finally:
+        s.close()
+
+
 def _read_power_now() -> str | None:
     """REST PowerState read *now*, normalised to 'on'/'standby', None if unreachable.
 
@@ -703,6 +739,31 @@ class TVState:
             }
 
 
+STALE_AFTER = 20.0   # seconds a poll snapshot may be believed
+
+
+def _snapshot_age(snap) -> float:
+    """Age of the last poll in seconds, or a big number when it has no timestamp."""
+    ts = (snap or {}).get("timestamp")
+    if not ts:
+        return 1e9
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+    except Exception:
+        return 1e9
+
+
+def _retry_delay(connected: bool) -> float:
+    """How long to stay off the TV's socket after a poll failure.
+
+    A refused/absent connection may make the set raise an "Allow this device?"
+    dialog on every attempt, so that path waits a full minute. A socket that was
+    already up and then dropped a read is not a pairing event — it retries in 5 s,
+    which is what keeps the card current instead of a minute behind.
+    """
+    return 5.0 if connected else 60.0
+
+
 def poller_loop(state: TVState, stop_event: threading.Event):
     """Background thread: keep a WS connection to the app-control channel
     and repeatedly cycle through CANDIDATE_APP_IDS with ms.application.get.
@@ -746,6 +807,7 @@ def poller_loop(state: TVState, stop_event: threading.Event):
         # poller as a different client than the paired one.
         _q = f"name={_b64(CLIENT_NAME)}"
         url = f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v2?{_q}"
+        connected = False
         try:
             ws = websocket.create_connection(
                 url, timeout=8, sslopt={"cert_reqs": ssl.CERT_NONE}
@@ -754,6 +816,7 @@ def poller_loop(state: TVState, stop_event: threading.Event):
             first = json.loads(ws.recv())
             if first.get("event") != "ms.channel.connect":
                 raise RuntimeError(f"unexpected handshake reply: {first}")
+            connected = True
             # No token adoption here: the app-control channel has its own identity and
             # its token is not the remote-control token. Mixing them was a race and a
             # correctness bug (review item 2).
@@ -761,6 +824,12 @@ def poller_loop(state: TVState, stop_event: threading.Event):
             while not stop_event.is_set():
                 installed = []
                 running_app = None
+                # A slow id must not cost a whole minute: 14 sequential probes with an
+                # 8 s socket timeout meant one unanswered id froze the card for the
+                # length of the timeout AND the 60 s reconnect backoff (measured lag:
+                # 30-60 s after an app change). Probe with a short timeout and skip.
+                ws.settimeout(3)
+                misses = 0
                 for app_id in CANDIDATE_APP_IDS:
                     ws.send(
                         json.dumps(
@@ -773,8 +842,14 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                     )
                     try:
                         reply = json.loads(ws.recv())
+                    except websocket.WebSocketTimeoutException:
+                        misses += 1
+                        if misses >= 3:
+                            raise RuntimeError("recv timed out on 3 ids: socket is dead")
+                        continue
                     except Exception as e:
                         raise RuntimeError(f"recv failed for {app_id}: {e}") from e
+                    misses = 0
 
                     if reply.get("error"):
                         continue  # not installed / unknown id - skip silently
@@ -817,11 +892,12 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                 power=get_power_state(),
                 error=str(e),
             )
-            # ponytail: back off 60s instead of 3s. Every reconnect attempt makes the
-            # TV raise an "Allow this device?" dialog, so a 3s retry loop turns a
-            # standby set into a prompt storm. 60s keeps recovery usable while the
-            # set is asleep; lower it only if telemetry needs to be fresher on wake.
-            for _ in range(120):
+            # ponytail: back off 60s instead of 3s when the *connect* failed. Every
+            # reconnect attempt makes the TV raise an "Allow this device?" dialog, so a
+            # 3s retry loop turns a standby set into a prompt storm. A failure on a
+            # socket that had already connected is not that: it is a dropped read, and
+            # 60 s of blindness is what made the card lag by a minute.
+            for _ in range(int(_retry_delay(connected) / 0.5)):
                 if stop_event.is_set():
                     break
                 time.sleep(0.5)
@@ -922,14 +998,31 @@ def control_power_on() -> dict:
     # would switch it ON-to-OFF or OFF-to-ON with equal confidence. Refuse instead.
     if power not in ("standby", "off"):
         return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
-    if _send_remote_key("KEY_POWER") is False:
-        # _send_remote_key is the only place an ms.error refusal is visible; ignoring
-        # it reported a wake that the TV had just rejected.
-        return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
-    ok = _verify_power("on")
+    # Wake-on-LAN first: it is the only path that needs no pairing token, so a lost
+    # token no longer means "cannot turn the TV on". A set in deep standby answers
+    # no socket at all, and the WS key cannot reach it.
+    method = None
+    sent = False
+    if _wake_on_lan():
+        sent = True
+        method = "wol"
+        ok = _verify_power("on", tries=12, delay=1.0)
+    else:
+        ok = False
+    if not ok:
+        # Standby (not deep sleep): the remote channel still answers, so a key works.
+        if _send_remote_key("KEY_POWER") is False:
+            # _send_remote_key is the only place an ms.error refusal is visible;
+            # ignoring it reported a wake that the TV had just rejected.
+            if not sent:
+                return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
+        else:
+            sent = True
+            method = "wol+key" if method else "key"
+            ok = _verify_power("on")
     if ok:
         _note_power("on", deliberate=True)
-    return {"sent": True, "power": power, "reason": None, "verified": ok}
+    return {"sent": sent, "power": power, "reason": None, "verified": ok, "method": method}
 
 
 def _remote_url(token=""):
@@ -1612,7 +1705,21 @@ def make_handler(state: TVState):
             _note_request(self.path)
             if self.path == "/v1/state":
                 snap = state.snapshot()
+                # A frozen poll must not be replayed as the truth. When the poller backs
+                # off, the snapshot keeps its last values forever, which is how a set in
+                # standby still read "on, YouTube" 50 s later. Old snapshot: no app
+                # claim, and power decided by a live REST read (a set that answers
+                # nothing at all is off, not on).
+                if _snapshot_age(snap) > STALE_AFTER:
+                    snap["running_app"] = None
+                    _live = _read_power_now()
+                    snap["power"] = _live or "standby"
+                    if not snap.get("last_error"):
+                        snap["last_error"] = f"poll stale ({_snapshot_age(snap):.0f}s)"
                 snap["agent"] = _AGENT.snapshot()
+                if _snapshot_age(state.snapshot()) > STALE_AFTER:
+                    # the agent's last foreground app is just as stale as the poll
+                    snap["agent"]["foregroundApp"] = None
                 # Live-TV data belongs to live TV. While a real app is visible the
                 # agent's last channel/program is archaeology — it was "PRO TV HD" /
                 # "Vocea Romaniei" next to a playing YouTube — so drop it now instead
