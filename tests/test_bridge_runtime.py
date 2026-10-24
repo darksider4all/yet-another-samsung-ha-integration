@@ -280,3 +280,13 @@ class PowerOnHttpTest(BridgeTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CorsForTheTvWizard(BridgeTest):
+    """The on-TV app discovers the bridge by XHR-ing 254 hosts and reading x.status;
+    without Access-Control-Allow-Origin every probe is opaque and it reports "not found"."""
+
+    def test_state_answer_allows_cross_origin(self):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/state")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), "*")

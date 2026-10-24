@@ -1747,6 +1747,13 @@ def make_handler(state: TVState):
             # API/config responses reflect live state; never let the browser cache them.
             if self.path.startswith("/v1/") or self.path in ("/config", "/", "/index.html"):
                 self.send_header("Cache-Control", "no-store")
+            # The on-TV app's setup wizard finds the bridge by XHR-ing 254 addresses and
+            # reading x.status: without this header every probe is opaque (status 0) and
+            # discovery reports "not found" even when the bridge answers.
+            self.send_header("Access-Control-Allow-Origin", "*")
+            if self.command == "OPTIONS":
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
             self.wfile.write(body_bytes)
 
