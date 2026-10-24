@@ -52,6 +52,7 @@ class PowerOffContract(unittest.TestCase):
         self.m._verify_power = lambda want, tries=6, delay=0.7: True
         # never put a real magic packet on the LAN from a test
         self.m._wake_on_lan = lambda *a, **k: False
+        self.m._arm_verify = lambda *a, **k: None
 
     def test_sends_when_on(self):
         self.m._POWER_CACHE = "on"
@@ -130,11 +131,12 @@ class PowerOnContract(unittest.TestCase):
         self.m._verify_power = lambda want, tries=6, delay=0.7: True
         # never put a real magic packet on the LAN from a test
         self.m._wake_on_lan = lambda *a, **k: False
+        self.m._arm_verify = lambda *a, **k: None
 
     def test_sends_when_off(self):
         self.m._POWER_CACHE = "standby"
         self.assertEqual(
-            self.m.control_power_on(), {"sent": True, "power": "standby", "reason": None, "verified": True, "method": "key"}
+            self.m.control_power_on(), {"sent": True, "power": "standby", "reason": None, "verified": False, "method": "key", "pending": True}
         )
         self.assertEqual(self.sent, ["KEY_POWER"])
 
@@ -162,39 +164,6 @@ class PowerOnContract(unittest.TestCase):
         self.assertEqual(self.m._POWER_CACHE, "standby", "a refused key changed no state")
 
 
-class StandbyPrimingTest(unittest.TestCase):
-    """P1-2: the WS poller's standby inference was computed and thrown away, so after a
-    turn_off + power loss the cache stayed None and turn_on refused as power_unknown.
-    The fix is a pure decision helper plus a _note_power() call - pinned here because
-    the poller loop itself needs a TV."""
-
-    def setUp(self):
-        self.m = _load_reader()
-        self.sent = []
-        self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
-        self.m._POWER_CACHE = None
-
-    def test_rest_confirmed_standby_primes_the_cache(self):
-        self.m._note_power(self.m._ws_power_note(None, "standby"))
-        self.assertEqual(self.m._POWER_CACHE, "standby")
-        self.assertTrue(self.m.control_power_on()["sent"], "turn_on must fire after priming")
-        self.assertEqual(self.sent, ["KEY_POWER"])
-
-    def test_a_visible_app_still_means_on(self):
-        self.m._note_power(self.m._ws_power_note({"appId": "x", "visible": True}, "standby"))
-        self.assertEqual(self.m._POWER_CACHE, "on")
-
-    def test_no_inference_without_solid_evidence(self):
-        # a hidden running app proves nothing, and REST 'on' may only confirm on
-        self.assertIsNone(
-            self.m._ws_power_note({"appId": "x", "running": True, "visible": False}, None)
-        )
-        self.assertIsNone(self.m._ws_power_note(None, "on"))
-        self.assertIsNone(self.m._ws_power_note(None, None))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class PowerTruthContract(unittest.TestCase):
@@ -234,11 +203,17 @@ class PowerTruthContract(unittest.TestCase):
         self.assertFalse(result["verified"], "a key is never acked: only the poll proves it")
         self.assertEqual(self.m._POWER_CACHE, "standby", "an unverified toggle must not lock the cache")
 
-    def test_rest_unreachable_falls_back_to_the_cache(self):
+    def test_unreachable_set_goes_to_wol(self):
+        """A set that answers nothing is in deep standby: only WoL reaches it."""
         self.m._POWER_CACHE = "standby"
         self.m._read_power_now = lambda: None
+        self.m._wake_on_lan = lambda *a, **k: True
+        self.m._arm_verify = lambda *a, **k: None
         result = self.m.control_power_on()
         self.assertTrue(result["sent"])
+        self.assertEqual(result["method"], "wol")
+        self.assertTrue(result["pending"], "verification is deferred, not dropped")
+        self.assertEqual(self.sent, [], "no key: nothing answers to receive one")
 
 
 class WakeOnLanContract(unittest.TestCase):
@@ -251,49 +226,31 @@ class WakeOnLanContract(unittest.TestCase):
         self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
         self.m.TV_TOKEN = "token"
         self.m._POWER_CACHE = "standby"
-        self.m._read_power_now = lambda: "standby"
+        self.m._read_power_now = lambda: None
 
     def test_wol_alone_wakes_without_using_the_token(self):
         self.m._wake_on_lan = lambda *a, **k: True
-        self.m._verify_power = lambda want, tries=12, delay=1.0: True
         result = self.m.control_power_on()
-        self.assertTrue(result["verified"])
         self.assertEqual(result["method"], "wol")
+        self.assertTrue(result["pending"], "verification is deferred so HA does not time out")
         self.assertEqual(self.sent, [], "no key: the wake path must not need pairing")
 
-    def test_wol_then_key_when_the_set_is_only_in_standby(self):
-        self.m._wake_on_lan = lambda *a, **k: True
-        self.m._verify_power = lambda want, tries=12, delay=1.0: False
+    def test_a_set_that_answers_is_woken_by_key(self):
+        self.m._read_power_now = lambda: "standby"
         result = self.m.control_power_on()
-        self.assertEqual(result["method"], "wol+key")
+        self.assertEqual(result["method"], "key")
         self.assertEqual(self.sent, ["KEY_POWER"])
 
-    def test_neither_path_lands_is_reported_unverified(self):
-        self.m._wake_on_lan = lambda *a, **k: True
-        self.m._verify_power = lambda want, tries=12, delay=1.0: False
-        self.m._send_remote_key = lambda key: False
+    def test_no_wol_and_no_answer_is_a_refusal(self):
+        self.m._wake_on_lan = lambda *a, **k: False
+        self.m._read_power_now = lambda: None
         result = self.m.control_power_on()
-        self.assertTrue(result["sent"], "a packet did leave the host")
-        self.assertFalse(result["verified"])
-        self.assertEqual(self.m._POWER_CACHE, "standby", "an unverified wake must not lock the cache")
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "power_unknown")
 
     def test_no_mac_means_no_wol(self):
         self.m._cfg = lambda k, d=None: "" if k == "tv_mac" else d
         self.assertFalse(self.m._wake_on_lan(bursts=1, interval=0))
-
-
-class PollerBackoffContract(unittest.TestCase):
-    """60 s of blindness after a dropped read is what made the card lag by a minute."""
-
-    def setUp(self):
-        self.m = _load_reader()
-
-    def test_dropped_read_retries_fast(self):
-        self.assertEqual(self.m._retry_delay(True), 5.0)
-
-    def test_refused_connect_still_waits_a_minute(self):
-        # every failed connect can raise an "Allow this device?" dialog on the TV
-        self.assertEqual(self.m._retry_delay(False), 60.0)
 
 
 class StaleSnapshotContract(unittest.TestCase):
@@ -359,3 +316,39 @@ class RestAppPollContract(unittest.TestCase):
     def test_no_tv_ip_configured(self):
         self.m._cfg = lambda k, d=None: d
         self.assertEqual(self.m.poll_apps()[2], "no tv_ip configured")
+
+
+class PollerWatchdogContract(unittest.TestCase):
+    """Reported: after a full TV restart the card stayed frozen until the add-on was
+    restarted, i.e. the poll thread was dead and nothing respawned it."""
+
+    def setUp(self):
+        self.m = _load_reader()
+
+    def test_age_is_zero_before_the_first_cycle(self):
+        self.m._POLL_BEAT = 0.0
+        self.assertEqual(self.m.poller_age(), 0.0)
+
+    def test_age_grows_after_a_beat(self):
+        import time as _t
+        self.m._POLL_BEAT = _t.monotonic() - 42
+        self.assertGreater(self.m.poller_age(), 30)
+
+    def test_poller_survives_a_raising_cycle(self):
+        import threading as _t
+        calls = {"n": 0}
+
+        def boom():
+            calls["n"] += 1
+            raise RuntimeError("tv rebooted")
+
+        self.m.poll_apps = boom
+        st = self.m.TVState()
+        ev = _t.Event()
+        th = _t.Thread(target=self.m.poller_loop, args=(st, ev), daemon=True)
+        th.start()
+        _t.Event().wait(0.6)
+        ev.set()
+        th.join(timeout=2)
+        self.assertGreater(calls["n"], 0, "the poll loop died on the first error")
+        self.assertIn("tv rebooted", (st.snapshot().get("last_error") or ""))

@@ -599,10 +599,12 @@ def _note_power(p, deliberate=False):
 def _effective_power(snap):
     """What the TV is doing, for display and for the card's on/off state.
 
-    Live evidence beats everything: a visible/running app or a real agent foreground
-    app means the screen is on. REST PowerState is the weakest signal on this model
-    (it reports 'standby' while the set is lit), so it may only *confirm* on, never
-    veto it. A deliberate power command holds its value for POWER_INTENT_GRACE.
+    Live evidence beats everything: a visible/running app means the screen is on.
+    REST PowerState is authoritative as of the 2026-10-24 measurement (10/10 correct
+    over 20 s while lit; it also read "standby" correctly in network standby), and the
+    toggle guards in control_power_on/off depend on that being true. The older
+    "REST lies about standby" note was from the era when a stale cache, not REST, was
+    feeding the card; it no longer applies.
     """
     ra = snap.get("running_app") or {}
     ag = snap.get("agent") or {}
@@ -622,7 +624,7 @@ def _effective_power(snap):
     return _POWER_CACHE or "off"
 
 
-def _wake_on_lan(bursts: int = 10, interval: float = 1.0) -> bool:
+def _wake_on_lan(bursts: int = 3, interval: float = 0.5) -> bool:
     """Magic packet to the set, broadcast + unicast. Returns True if it was sent.
 
     Measured 2026-10-24 on the DU85: after a real power-off the TV stops answering
@@ -666,10 +668,29 @@ def _read_power_now() -> str | None:
     KEY_POWER is a blind toggle, which then switched the TV off instead of on.
     Measured 2026-10-24: 10/10 correct 'on' reads over 20 s while the set was lit.
     """
-    p = get_power_state()
+    p = (get_power_state() or "").strip().lower()
     if not p:
         return None
-    return "on" if p == "on" else "standby"
+    # This firmware spells it "on"; accept any case/alias anyway, because folding an
+    # unknown literal into "standby" would silently invert the blind-toggle guard.
+    if p in ("on", "poweron", "power_on", "true"):
+        return "on"
+    if p in ("standby", "off", "poweroff", "power_off", "false"):
+        return "standby"
+    return None
+
+
+def _arm_verify(want: str, tries: int = 8, delay: float = 1.0) -> None:
+    """Verify a power flip in the background and lock the cache when it lands.
+
+    The HA client posts with ClientTimeout(total=10), so a handler that spends 20-80 s
+    waiting for the set to come up answers "timeout" for a wake that actually worked.
+    The command therefore answers immediately and this finishes the job.
+    """
+    def run():
+        if _verify_power(want, tries, delay):
+            _note_power(want, deliberate=True)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _verify_power(want: str, tries: int = 6, delay: float = 0.7) -> bool:
@@ -680,21 +701,6 @@ def _verify_power(want: str, tries: int = 6, delay: float = 0.7) -> bool:
         if _read_power_now() == want:
             return True
     return False
-
-
-def _ws_power_note(running_app, power):
-    """Which power inference the WS poller may record, or None to record nothing.
-
-    Same rules as the agent branch: a visible app means on; the only other solid
-    signal is REST confirming standby/off while nothing is running. Returned rather
-    than written so the loop's decision is testable without a TV (it used to compute
-    'on' and throw it away, leaving the cache empty for control_power_on to refuse).
-    """
-    if running_app and running_app.get("visible"):
-        return "on"
-    if running_app is None and power in ("standby", "off"):
-        return "standby"
-    return None
 
 
 def get_power_state() -> str | None:
@@ -753,17 +759,6 @@ def _snapshot_age(snap) -> float:
         return 1e9
 
 
-def _retry_delay(connected: bool) -> float:
-    """How long to stay off the TV's socket after a poll failure.
-
-    A refused/absent connection may make the set raise an "Allow this device?"
-    dialog on every attempt, so that path waits a full minute. A socket that was
-    already up and then dropped a read is not a pairing event — it retries in 5 s,
-    which is what keeps the card current instead of a minute behind.
-    """
-    return 5.0 if connected else 60.0
-
-
 def _rest_app_status(app_id: str) -> dict | None:
     """One app's live status from the TV's own REST API (no auth, no token).
 
@@ -774,6 +769,10 @@ def _rest_app_status(app_id: str) -> dict | None:
     """
     try:
         return json.loads(_rest_request(f"applications/{app_id}"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {}          # reachable, app simply not installed
+        return None
     except Exception:
         return None
 
@@ -788,6 +787,8 @@ def poll_apps() -> tuple[list, dict | None, str | None]:
     misses = 0
     for app_id in CANDIDATE_APP_IDS:
         st = _rest_app_status(app_id)
+        if st == {}:
+            continue            # 404: the TV answered, this app is just not installed
         if st is None:
             misses += 1
             if misses >= 3 and not installed:
@@ -807,6 +808,39 @@ def poll_apps() -> tuple[list, dict | None, str | None]:
     return installed, running, None
 
 
+_POLL_BEAT = 0.0        # monotonic timestamp of the last completed poll cycle
+_WATCHDOG_AFTER = 30.0  # a poller quiet this long is restarted
+
+
+def poller_age() -> float:
+    """Seconds since the last completed poll cycle (0.0 when never run)."""
+    if not _POLL_BEAT:
+        return 0.0
+    return time.monotonic() - _POLL_BEAT
+
+
+def poller_watchdog(state: TVState, stop_event: threading.Event, holder: dict):
+    """Restart the poller if it ever stops beating.
+
+    Reported fault: after a full TV restart the card stayed frozen until the add-on
+    itself was restarted, i.e. the poll thread had died and nothing brought it back.
+    Daemon threads do not self-heal, so watch the heartbeat and respawn.
+    """
+    global _POLL_BEAT
+    while not stop_event.is_set():
+        time.sleep(5)
+        t = holder.get("poller")
+        dead = t is None or not t.is_alive()
+        stale = bool(_POLL_BEAT) and poller_age() > _WATCHDOG_AFTER
+        if dead or stale:
+            why = "dead" if dead else f"silent {poller_age():.0f}s"
+            print(f"poller {why} - restarting")
+            nt = threading.Thread(target=poller_loop, args=(state, stop_event), daemon=True)
+            nt.start()
+            holder["poller"] = nt
+            _POLL_BEAT = time.monotonic()
+
+
 def poller_loop(state: TVState, stop_event: threading.Event):
     """Background thread: keep the TV's app list and foreground app current over REST.
 
@@ -816,13 +850,18 @@ def poller_loop(state: TVState, stop_event: threading.Event):
     The TV's REST API answers the same question faster and unauthenticated, so the WS is
     now only used to press keys.
     """
+    global _POLL_BEAT
     while not stop_event.is_set():
-        installed, running, err = poll_apps()
-        power = _read_power_now() or ("on" if running else "standby")
-        if running and running.get("visible"):
-            power = "on"
-        _note_power("on" if power == "on" else "standby")
-        state.update(installed, running, power=power, error=err)
+        try:
+            installed, running, err = poll_apps()
+            power = _read_power_now() or ("on" if running else "standby")
+            if running and running.get("visible"):
+                power = "on"
+            _note_power("on" if power == "on" else "standby")
+            state.update(installed, running, power=power, error=err)
+        except Exception as e:  # a dead thread never recovers, even when the TV does
+            state.update([], None, power=None, error=f"poller: {e}")
+        _POLL_BEAT = time.monotonic()
         for _ in range(int(POLL_INTERVAL / 0.5)):
             if stop_event.is_set():
                 break
@@ -901,48 +940,33 @@ def control_wol() -> bool:
 
 
 def control_power_on() -> dict:
-    """Local power-on: in network-standby the TV's remote-control WS still answers,
-    and KEY_POWER toggles it back on (verified). Idempotent - no key is sent when we
-    already know the set is on. A *fully* powered-off TV won't answer; the HA layer
-    falls back to its delegate then.
+    """Wake the set, answering fast enough for the HA client's 10 s timeout.
 
-    Answers what actually happened, like control_power_off: a bare True made "no key
-    sent because we thought it was already on" indistinguishable from a real wake.
-    'sent' means the frame left the bridge - the TV never acks a keypress, so a
-    silent socket still reads as sent; only an explicit ms.error is a send_failed."""
-    power = _read_power_now() or _POWER_CACHE   # live read first; cache is the fallback
+    Order matters and is measured on this set:
+    - REST answers "standby" while the TV is lit or in network standby, so a set that
+      answers is woken with KEY_POWER (instant, no token needed to *send* — the TV asks
+      once if it has forgotten the pairing).
+    - A set that answers NOTHING is in deep standby: KeyPress cannot reach it and a WoL
+      burst is the only way in (a 3-packet burst woke it in ~3 s).
+    Verification runs in the background (_arm_verify) so the caller is never held for
+    the 20-80 s a full wake can take.
+    """
+    power = _read_power_now()
     if power == "on":
         _note_power("on")
         return {"sent": False, "power": power, "reason": "already_on", "verified": True}
-    # KEY_POWER is a blind toggle: if we are not *sure* the set is off, sending it
-    # would switch it ON-to-OFF or OFF-to-ON with equal confidence. Refuse instead.
-    if power not in ("standby", "off"):
-        return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
-    # Wake-on-LAN first: it is the only path that needs no pairing token, so a lost
-    # token no longer means "cannot turn the TV on". A set in deep standby answers
-    # no socket at all, and the WS key cannot reach it.
-    method = None
-    sent = False
-    if _wake_on_lan():
-        sent = True
-        method = "wol"
-        ok = _verify_power("on", tries=12, delay=1.0)
-    else:
-        ok = False
-    if not ok:
-        # Standby (not deep sleep): the remote channel still answers, so a key works.
+    if power is not None:                      # it answered: network standby
         if _send_remote_key("KEY_POWER") is False:
-            # _send_remote_key is the only place an ms.error refusal is visible;
-            # ignoring it reported a wake that the TV had just rejected.
-            if not sent:
-                return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
-        else:
-            sent = True
-            method = "wol+key" if method else "key"
-            ok = _verify_power("on")
-    if ok:
-        _note_power("on", deliberate=True)
-    return {"sent": sent, "power": power, "reason": None, "verified": ok, "method": method}
+            return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
+        _arm_verify("on")
+        return {"sent": True, "power": power, "reason": None, "verified": False,
+                "method": "key", "pending": True}
+    # No answer at all: deep standby. Only Wake-on-LAN reaches it, and it needs no token.
+    if not _wake_on_lan():
+        return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
+    _arm_verify("on", tries=20, delay=1.0)
+    return {"sent": True, "power": power, "reason": None, "verified": False,
+            "method": "wol", "pending": True}
 
 
 def _remote_url(token=""):
@@ -1072,7 +1096,7 @@ def control_power_off() -> dict:
         return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
     # deliberate: locks the cache so the poller cannot snap it back to "on" and
     # let a second turn_off flip the set back on
-    ok = _verify_power("standby")
+    ok = _verify_power("standby", tries=4, delay=0.5)   # ~2 s: the set answers while lit
     if ok:
         _note_power("standby", deliberate=True)
     return {"sent": True, "power": power, "reason": None, "verified": ok}
@@ -1630,6 +1654,7 @@ def make_handler(state: TVState):
                 # standby still read "on, YouTube" 50 s later. Old snapshot: no app
                 # claim, and power decided by a live REST read (a set that answers
                 # nothing at all is off, not on).
+                snap["poller_age"] = round(poller_age(), 1)
                 if _snapshot_age(snap) > STALE_AFTER:
                     snap["running_app"] = None
                     _live = _read_power_now()
@@ -1987,8 +2012,11 @@ def main():
     state = TVState()
     stop_event = threading.Event()
 
+    holder = {}
     poller = threading.Thread(target=poller_loop, args=(state, stop_event), daemon=True)
     poller.start()
+    holder["poller"] = poller
+    threading.Thread(target=poller_watchdog, args=(state, stop_event, holder), daemon=True).start()
 
     server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), make_handler(state))
     print(f"reader.py listening on http://0.0.0.0:{HTTP_PORT}/  (dashboard /, JSON /v1/state, POST /v1/control)")

@@ -226,8 +226,15 @@ class PowerOnHttpTest(BridgeTest):
     """Over HTTP: a turn_on the bridge refuses must be a refusal, not a 200 that HA
     reads as success. power_on used to answer `ok: true` for every call."""
 
+    def _stub_power(self, state):
+        """power_on reads the live REST state now, so each test states it explicitly."""
+        self.mod._read_power_now = lambda: state
+        self.mod._arm_verify = lambda *a, **k: None
+        self.mod._wake_on_lan = lambda *a, **k: False
+
     def test_unknown_power_is_refused_with_409(self):
         from urllib.error import HTTPError
+        self._stub_power(None)
 
         with self.assertRaises(HTTPError) as ctx:
             self.post("/v1/control", {"action": "power_on"})
@@ -236,7 +243,7 @@ class PowerOnHttpTest(BridgeTest):
         self.assertEqual(body["reason"], "power_unknown")
 
     def test_already_on_is_200_and_sends_no_key(self):
-        self.mod._POWER_CACHE = "on"
+        self._stub_power("on")
         status, body = self.post("/v1/control", {"action": "power_on"})
         self.assertEqual(status, 200)
         self.assertFalse(body["ok"], "nothing was sent, so ok must not claim it was")
@@ -246,7 +253,7 @@ class PowerOnHttpTest(BridgeTest):
         """The success path, end to end: standby + a real send must read as success.
         Both HTTP tests above cover refusals only, so 'ok' could be False for ever."""
         self.mod.TV_TOKEN = "token"
-        self.mod._POWER_CACHE = "standby"
+        self._stub_power("standby")
         self.mod._send_remote_key = lambda key: True
         status, body = self.post("/v1/control", {"action": "power_on"})
         self.assertEqual(status, 200)
@@ -258,6 +265,7 @@ class PowerOnHttpTest(BridgeTest):
         """_send_remote_key's ms.error detection had no consumer in the power path."""
         self.mod.TV_TOKEN = "token"
         self.mod._POWER_CACHE = "standby"
+        self._stub_power("standby")
         self.mod._send_remote_key = lambda key: False
         from urllib.error import HTTPError
 
