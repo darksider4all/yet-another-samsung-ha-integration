@@ -45,6 +45,7 @@ TV_PORT = 8002
 REST_PORT = 8001
 CLIENT_NAME = "yast-bridge"
 HTTP_PORT = 8777
+POLL_INTERVAL_IDLE = 30  # seconds between polls while the set is off (lets it sleep)
 POLL_INTERVAL = 2  # seconds between probe cycles (was 4: card lagged ~7s after an app change)
 # Persistent storage. The add-on's /data volume survives updates and rebuilds;
 # a path inside the image (/app/...) is wiped every time the container is
@@ -853,8 +854,21 @@ def poller_loop(state: TVState, stop_event: threading.Event):
     global _POLL_BEAT
     while not stop_event.is_set():
         try:
+            # One cheap REST read first: while the set is off there is no app to find,
+            # and asking 14 app endpoints every cycle would both waste requests and keep
+            # the TV's network stack from ever sleeping.
+            _p = _read_power_now()
+            if _p and _p != "on":
+                state.update(state.snapshot().get("installed_apps") or [], None, power=_p, error=None)
+                _POLL_BEAT = time.monotonic()
+                interval = POLL_INTERVAL_IDLE
+                for _ in range(int(interval / 0.5)):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.5)
+                continue
             installed, running, err = poll_apps()
-            power = _read_power_now() or ("on" if running else "standby")
+            power = _p or ("on" if running else "standby")
             if running and running.get("visible"):
                 power = "on"
             _note_power("on" if power == "on" else "standby")
@@ -862,7 +876,12 @@ def poller_loop(state: TVState, stop_event: threading.Event):
         except Exception as e:  # a dead thread never recovers, even when the TV does
             state.update([], None, power=None, error=f"poller: {e}")
         _POLL_BEAT = time.monotonic()
-        for _ in range(int(POLL_INTERVAL / 0.5)):
+        # Poll fast while the screen is on, slowly while it is not: a REST request
+        # every 2 s keeps the set's network stack awake and stops it ever reaching deep
+        # standby (measured: :8001 never closed over 150 s). Telemetry is only worth
+        # 2 s resolution while something is being watched.
+        interval = POLL_INTERVAL if power == "on" else POLL_INTERVAL_IDLE
+        for _ in range(int(interval / 0.5)):
             if stop_event.is_set():
                 break
             time.sleep(0.5)
