@@ -420,3 +420,87 @@ class AgentErrorIsNotAnApp(unittest.TestCase):
         ag = self.m.AgentState()
         ag.update_from_report({"source": "tv-agent", "foregroundApp": "111299001912", "ts": 1})
         self.assertEqual(ag.snapshot().get("foregroundApp"), "111299001912")
+
+
+class WatchdogVsIdleCadence(unittest.TestCase):
+    """The watchdog must not respawn a poller that is merely sleeping between idle polls."""
+
+    def setUp(self):
+        self.m = _load_reader()
+
+    def test_watchdog_is_well_above_the_idle_interval(self):
+        self.assertGreater(self.m._WATCHDOG_AFTER, self.m.POLL_INTERVAL_IDLE * 3)
+
+    def test_a_poller_resting_between_idle_polls_is_not_stale(self):
+        import time as _t
+        self.m._POLL_BEAT = _t.monotonic() - (self.m.POLL_INTERVAL_IDLE + 5)
+        self.assertLess(self.m.poller_age(), self.m._WATCHDOG_AFTER)
+
+
+class OptimisticOffIsCorrectedContract(unittest.TestCase):
+    """Pro's review: the optimistic clear could report "off" while the set was on."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.m._read_power_now = lambda: "on"
+        self.app = {"appId": "3201907018807", "name": "Netflix", "visible": True}
+        self.state = self.m.TVState()
+        self.state.update([self.app], self.app, power="on")
+        self.m._STATE = self.state
+
+    def test_unconfirmed_off_does_not_lock_standby(self):
+        self.m._send_remote_key = lambda key: True
+        self.m._verify_power = lambda *a, **k: False       # the key did not land
+        self.m.control_power_off()
+        snap = self.state.snapshot()
+        self.assertEqual(snap["power"], "on", "claimed off without evidence")
+        self.assertEqual((snap["running_app"] or {}).get("name"), "Netflix",
+                         "the app was dropped for an off that never happened")
+
+    def test_confirmed_off_locks_standby(self):
+        self.m._send_remote_key = lambda key: True
+        self.m._verify_power = lambda *a, **k: True
+        self.m.control_power_off()
+        self.assertEqual(self.state.snapshot()["power"], "standby")
+        self.assertIsNone(self.state.snapshot()["running_app"])
+
+    def test_a_send_that_raises_restores_the_card(self):
+        def boom(key):
+            raise RuntimeError("socket closed")
+        self.m._send_remote_key = boom
+        self.m._verify_power = lambda *a, **k: True
+        result = self.m.control_power_off()
+        self.assertEqual(result["reason"], "send_error")
+        snap = self.state.snapshot()
+        self.assertEqual((snap["running_app"] or {}).get("name"), "Netflix")
+        self.assertEqual(snap["power"], "on")
+
+    def test_a_stale_wake_verify_cannot_override_a_later_off(self):
+        """generation guard: the wake lands after the user turned the set off again."""
+        self.m._note_power("standby", deliberate=True)
+        old_gen = self.m.bump_power_gen()
+        self.m.bump_power_gen()                    # a newer command supersedes it
+        self.m._verify_power = lambda *a, **k: True
+        self.m._arm_verify("on", gen=old_gen)
+        import time as _t
+        _t.sleep(0.3)                              # let the thread run
+        self.assertEqual(self.m._POWER_CACHE, "standby",
+                         "a stale wake locked 'on' over a newer off")
+
+
+
+class PowerStateLiteralContract(unittest.TestCase):
+    """Untested before the review: an unknown literal must be unknown, not 'standby'."""
+
+    def setUp(self):
+        self.m = _load_reader()      # _read_power_now left intact on purpose
+
+    def test_unknown_literal_is_none(self):
+        self.m.get_power_state = lambda: "Weird"
+        self.assertIsNone(self.m._read_power_now())
+
+    def test_aliases_are_normalised(self):
+        for raw, want in (("on", "on"), ("On", "on"), ("PowerOn", "on"),
+                          ("standby", "standby"), ("Off", "standby")):
+            self.m.get_power_state = lambda r=raw: r
+            self.assertEqual(self.m._read_power_now(), want, raw)

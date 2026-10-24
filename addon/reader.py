@@ -636,6 +636,12 @@ def clear_running_app(power=None):
     included — was served in the meantime. A deliberate power command knows better
     than the poll does, so it says so at once.
     """
+    # Older HA entities read agent.foregroundApp, and _effective_power treats any
+    # non-"err" string as "on", so leaving it set kept reporting a lit TV.
+    try:
+        _AGENT.clear_foreground()
+    except Exception:
+        pass
     if _STATE is None:
         return
     snap = _STATE.snapshot()
@@ -699,16 +705,27 @@ def _read_power_now() -> str | None:
     return None
 
 
-def _arm_verify(want: str, tries: int = 8, delay: float = 1.0) -> None:
+_POWER_GEN = 0   # bumped by every power command; a stale verify must not win
+
+
+def bump_power_gen() -> int:
+    global _POWER_GEN
+    _POWER_GEN += 1
+    return _POWER_GEN
+
+
+def _arm_verify(want: str, tries: int = 8, delay: float = 1.0, gen: int | None = None) -> None:
     """Verify a power flip in the background and lock the cache when it lands.
 
     The HA client posts with ClientTimeout(total=10), so a handler that spends 20-80 s
     waiting for the set to come up answers "timeout" for a wake that actually worked.
     The command therefore answers immediately and this finishes the job.
     """
+    gen = _POWER_GEN if gen is None else gen
+
     def run():
-        if _verify_power(want, tries, delay):
-            _note_power(want, deliberate=True)
+        if _verify_power(want, tries, delay) and gen == _POWER_GEN:
+            _note_power(want, deliberate=True)   # a newer command supersedes this one
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -764,7 +781,7 @@ class TVState:
             }
 
 
-STALE_AFTER = 20.0   # seconds a poll snapshot may be believed
+STALE_AFTER = 90.0   # seconds a poll snapshot may be believed (idle cadence is 30 s)
 
 
 def _snapshot_age(snap) -> float:
@@ -828,7 +845,10 @@ def poll_apps() -> tuple[list, dict | None, str | None]:
 
 
 _POLL_BEAT = 0.0        # monotonic timestamp of the last completed poll cycle
-_WATCHDOG_AFTER = 30.0  # a poller quiet this long is restarted
+# Must stay well above the idle cadence: the poller sleeps POLL_INTERVAL_IDLE (30 s)
+# while the set is off, so a 30 s watchdog respawned a healthy poller every cycle
+# and left a pile of overlapping pollers behind.
+_WATCHDOG_AFTER = 120.0  # a poller quiet this long is restarted
 
 
 def poller_age() -> float:
@@ -961,21 +981,6 @@ def control_close_app(app_id: str) -> bool:
     return True
 
 
-def control_wol() -> bool:
-    """Wake-on-LAN magic packet. Does NOT wake this Wi-Fi TV (kept for reference)."""
-    mac = _cfg("tv_mac", "").replace(":", "").replace("-", "").lower()
-    if len(mac) != 12:
-        raise RuntimeError(f"bad/missing TV MAC {_cfg('tv_mac','')!r}")
-    magic = bytes.fromhex("ff" * 6 + mac * 16)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.sendto(magic, ("255.255.255.255", 9))
-    finally:
-        sock.close()
-    return True
-
-
 def control_power_on() -> dict:
     """Wake the set, answering fast enough for the HA client's 10 s timeout.
 
@@ -992,16 +997,17 @@ def control_power_on() -> dict:
     if power == "on":
         _note_power("on")
         return {"sent": False, "power": power, "reason": "already_on", "verified": True}
+    gen = bump_power_gen()
     if power is not None:                      # it answered: network standby
         if _send_remote_key("KEY_POWER") is False:
             return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
-        _arm_verify("on")
+        _arm_verify("on", gen=gen)
         return {"sent": True, "power": power, "reason": None, "verified": False,
                 "method": "key", "pending": True}
     # No answer at all: deep standby. Only Wake-on-LAN reaches it, and it needs no token.
     if not _wake_on_lan():
         return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
-    _arm_verify("on", tries=20, delay=1.0)
+    _arm_verify("on", tries=20, delay=1.0, gen=gen)
     return {"sent": True, "power": power, "reason": None, "verified": False,
             "method": "wol", "pending": True}
 
@@ -1133,15 +1139,29 @@ def control_power_off() -> dict:
     # TLS handshake (~5 s on this set), and leaving the old app on screen for that long
     # after the viewer pressed off is exactly the reported bug. A refused send restores it.
     prev = _STATE.snapshot() if _STATE is not None else {}
+    gen = bump_power_gen()
     clear_running_app("standby")
-    if _send_remote_key("KEY_POWER") is False:
+
+    def restore(why):
+        """The card was cleared optimistically: put the truth back when nothing landed."""
         if _STATE is not None:
             _STATE.update(prev.get("installed_apps") or [], prev.get("running_app"), power="on")
-        return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
-    # deliberate: locks the cache so the poller cannot snap it back to "on" and
-    # let a second turn_off flip the set back on
+        return {"sent": False, "power": power, "reason": why, "verified": False}
+
+    try:
+        sent = _send_remote_key("KEY_POWER")
+    except Exception:
+        return restore("send_error")     # a mid-send disconnect must not clear the card
+    if sent is False:
+        return restore("send_failed")
     ok = _verify_power("standby", tries=4, delay=0.5)   # ~2 s: the set answers while lit
-    _note_power("standby", deliberate=True)
+    if ok and gen == _POWER_GEN:
+        _note_power("standby", deliberate=True)
+    elif not ok:
+        # The key left the bridge but the set never confirmed. Do not claim "off";
+        # put the previous picture back and let the poller settle it next cycle.
+        if _STATE is not None:
+            _STATE.update(prev.get("installed_apps") or [], prev.get("running_app"), power="on")
     return {"sent": True, "power": power, "reason": None, "verified": ok}
 
 
@@ -1543,6 +1563,11 @@ class AgentState:
                 net["mac"] = _cfg("tv_mac", "")
                 d["network"] = net
         return d
+
+    def clear_foreground(self):
+        """Forget the agent's foreground app: the screen is off, so it is stale."""
+        with self._lock:
+            self._d["foregroundApp"] = None
 
     def last_seen_epoch(self):
         with self._lock:
