@@ -739,6 +739,17 @@ class TVState:
             }
 
 
+def _retry_delay(connected: bool) -> float:
+    """How long to stay off the TV's socket after a poll failure.
+
+    A refused/absent connection may make the set raise an "Allow this device?"
+    dialog on every attempt, so that path waits a full minute. A socket that was
+    already up and then dropped a read is not a pairing event — it retries in 5 s,
+    which is what keeps the card current instead of a minute behind.
+    """
+    return 5.0 if connected else 60.0
+
+
 def poller_loop(state: TVState, stop_event: threading.Event):
     """Background thread: keep a WS connection to the app-control channel
     and repeatedly cycle through CANDIDATE_APP_IDS with ms.application.get.
@@ -782,6 +793,7 @@ def poller_loop(state: TVState, stop_event: threading.Event):
         # poller as a different client than the paired one.
         _q = f"name={_b64(CLIENT_NAME)}"
         url = f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v2?{_q}"
+        connected = False
         try:
             ws = websocket.create_connection(
                 url, timeout=8, sslopt={"cert_reqs": ssl.CERT_NONE}
@@ -790,6 +802,7 @@ def poller_loop(state: TVState, stop_event: threading.Event):
             first = json.loads(ws.recv())
             if first.get("event") != "ms.channel.connect":
                 raise RuntimeError(f"unexpected handshake reply: {first}")
+            connected = True
             # No token adoption here: the app-control channel has its own identity and
             # its token is not the remote-control token. Mixing them was a race and a
             # correctness bug (review item 2).
@@ -797,6 +810,12 @@ def poller_loop(state: TVState, stop_event: threading.Event):
             while not stop_event.is_set():
                 installed = []
                 running_app = None
+                # A slow id must not cost a whole minute: 14 sequential probes with an
+                # 8 s socket timeout meant one unanswered id froze the card for the
+                # length of the timeout AND the 60 s reconnect backoff (measured lag:
+                # 30-60 s after an app change). Probe with a short timeout and skip.
+                ws.settimeout(3)
+                misses = 0
                 for app_id in CANDIDATE_APP_IDS:
                     ws.send(
                         json.dumps(
@@ -809,8 +828,14 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                     )
                     try:
                         reply = json.loads(ws.recv())
+                    except websocket.WebSocketTimeoutException:
+                        misses += 1
+                        if misses >= 3:
+                            raise RuntimeError("recv timed out on 3 ids: socket is dead")
+                        continue
                     except Exception as e:
                         raise RuntimeError(f"recv failed for {app_id}: {e}") from e
+                    misses = 0
 
                     if reply.get("error"):
                         continue  # not installed / unknown id - skip silently
@@ -853,11 +878,12 @@ def poller_loop(state: TVState, stop_event: threading.Event):
                 power=get_power_state(),
                 error=str(e),
             )
-            # ponytail: back off 60s instead of 3s. Every reconnect attempt makes the
-            # TV raise an "Allow this device?" dialog, so a 3s retry loop turns a
-            # standby set into a prompt storm. 60s keeps recovery usable while the
-            # set is asleep; lower it only if telemetry needs to be fresher on wake.
-            for _ in range(120):
+            # ponytail: back off 60s instead of 3s when the *connect* failed. Every
+            # reconnect attempt makes the TV raise an "Allow this device?" dialog, so a
+            # 3s retry loop turns a standby set into a prompt storm. A failure on a
+            # socket that had already connected is not that: it is a dropped read, and
+            # 60 s of blindness is what made the card lag by a minute.
+            for _ in range(int(_retry_delay(connected) / 0.5)):
                 if stop_event.is_set():
                     break
                 time.sleep(0.5)

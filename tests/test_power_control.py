@@ -280,3 +280,17 @@ class WakeOnLanContract(unittest.TestCase):
     def test_no_mac_means_no_wol(self):
         self.m._cfg = lambda k, d=None: "" if k == "tv_mac" else d
         self.assertFalse(self.m._wake_on_lan(bursts=1, interval=0))
+
+
+class PollerBackoffContract(unittest.TestCase):
+    """60 s of blindness after a dropped read is what made the card lag by a minute."""
+
+    def setUp(self):
+        self.m = _load_reader()
+
+    def test_dropped_read_retries_fast(self):
+        self.assertEqual(self.m._retry_delay(True), 5.0)
+
+    def test_refused_connect_still_waits_a_minute(self):
+        # every failed connect can raise an "Allow this device?" dialog on the TV
+        self.assertEqual(self.m._retry_delay(False), 60.0)
