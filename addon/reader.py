@@ -764,149 +764,69 @@ def _retry_delay(connected: bool) -> float:
     return 5.0 if connected else 60.0
 
 
+def _rest_app_status(app_id: str) -> dict | None:
+    """One app's live status from the TV's own REST API (no auth, no token).
+
+    GET /api/v2/applications/<id> answers {"id","name","running","visible","version"} —
+    the same data the WS poller asks for with ms.application.get, but over plain HTTP
+    on :8001. Measured on the DU85: ~10 ms per id, works in network standby, and needs
+    no pairing, so telemetry no longer depends on a token the TV may refuse.
+    """
+    try:
+        return json.loads(_rest_request(f"applications/{app_id}"))
+    except Exception:
+        return None
+
+
+def poll_apps() -> tuple[list, dict | None, str | None]:
+    """(installed, running_app, error) via REST. running_app only when visible —
+    a backgrounded app keeps running=true after another app takes the screen."""
+    if not _cfg("tv_ip", ""):
+        return [], None, "no tv_ip configured"
+    installed = []
+    running = None
+    misses = 0
+    for app_id in CANDIDATE_APP_IDS:
+        st = _rest_app_status(app_id)
+        if st is None:
+            misses += 1
+            if misses >= 3 and not installed:
+                return [], None, "rest unreachable"
+            continue
+        misses = 0
+        info = {
+            "appId": st.get("id", app_id),
+            "name": st.get("name"),
+            "running": bool(st.get("running")),
+            "visible": bool(st.get("visible")),
+            "version": st.get("version"),
+        }
+        installed.append(info)
+        if info["visible"]:
+            running = info
+    return installed, running, None
+
+
 def poller_loop(state: TVState, stop_event: threading.Event):
-    """Background thread: keep a WS connection to the app-control channel
-    and repeatedly cycle through CANDIDATE_APP_IDS with ms.application.get.
+    """Background thread: keep the TV's app list and foreground app current over REST.
+
+    This used to be a WebSocket that probed each app id with ms.application.get and
+    reconnected on every hiccup. Every reconnect risked an "Allow this device?" dialog,
+    the socket needed the pairing token, and one slow reply froze the card for a minute.
+    The TV's REST API answers the same question faster and unauthenticated, so the WS is
+    now only used to press keys.
     """
     while not stop_event.is_set():
-        ws = None
-        # ponytail: while the on-TV agent is reporting, it already delivers app and
-        # foreground telemetry over /v1/report — this WS adds nothing, and every
-        # reconnect makes the TV demand a fresh "Allow this device?". That retry loop
-        # is what turned one command into a stack of dialogs. Poll only as a fallback.
-        # ponytail: also stay off the TV while it is asleep. A standby set refuses the
-        # handshake and raises an Allow dialog per attempt, so polling it costs the
-        # user a screenful of prompts (9 observed) across one wake cycle.
-        # NOTE: do not gate on _POWER_CACHE here. A wrong cache entry (REST said
-        # 'standby' while the set was lit) used to stop the poller for good, so the
-        # card stayed blank and 'off' with nothing to disprove it. Only solid signals
-        # may stop the poller: the on-TV agent reporting, or no pairing token.
-        if (_AGENT.snapshot() or {}).get("online") or not TV_TOKEN:
-            # ponytail: no token means every reconnect raises an Allow dialog, so wait
-            # quietly instead of polling. Pairing (POST /v1/control {action:pair}) is
-            # the only thing that should ask the TV for permission.
-            # Trust the on-TV agent over the TV's REST PowerState (which lies on this
-            # model): a real foreground app means on; agent alive with nothing
-            # foreground means the screen is off. REST must never decide the cache.
-            _ag = (_AGENT.snapshot() or {})
-            _fg = _ag.get("foregroundApp")
-            _hint = "on" if (isinstance(_fg, str) and _fg and not _fg.startswith("err")) else None
-            if _hint is None and _ag.get("online") and get_power_state() in ("standby", "off"):
-                # agent alive + no foreground app, *confirmed* by REST: screen is off
-                _hint = "standby"
-            _note_power(_hint)
-            _snap = state.snapshot()
-            state.update(_snap["installed_apps"], _snap["running_app"], power=_hint)
-            for _ in range(POLL_INTERVAL * 2):
-                if stop_event.is_set():
-                    break
-                time.sleep(0.5)
-            continue
-        # The app-control channel takes no token (only the remote-control channel on
-        # the SSL port does). Sending one here was wrong: it made the TV treat the
-        # poller as a different client than the paired one.
-        _q = f"name={_b64(CLIENT_NAME)}"
-        url = f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v2?{_q}"
-        connected = False
-        try:
-            ws = websocket.create_connection(
-                url, timeout=8, sslopt={"cert_reqs": ssl.CERT_NONE}
-            )
-            ws.settimeout(8)
-            first = json.loads(ws.recv())
-            if first.get("event") != "ms.channel.connect":
-                raise RuntimeError(f"unexpected handshake reply: {first}")
-            connected = True
-            # No token adoption here: the app-control channel has its own identity and
-            # its token is not the remote-control token. Mixing them was a race and a
-            # correctness bug (review item 2).
-
-            while not stop_event.is_set():
-                installed = []
-                running_app = None
-                # A slow id must not cost a whole minute: 14 sequential probes with an
-                # 8 s socket timeout meant one unanswered id froze the card for the
-                # length of the timeout AND the 60 s reconnect backoff (measured lag:
-                # 30-60 s after an app change). Probe with a short timeout and skip.
-                ws.settimeout(3)
-                misses = 0
-                for app_id in CANDIDATE_APP_IDS:
-                    ws.send(
-                        json.dumps(
-                            {
-                                "id": app_id,
-                                "method": "ms.application.get",
-                                "params": {"id": app_id},
-                            }
-                        )
-                    )
-                    try:
-                        reply = json.loads(ws.recv())
-                    except websocket.WebSocketTimeoutException:
-                        misses += 1
-                        if misses >= 3:
-                            raise RuntimeError("recv timed out on 3 ids: socket is dead")
-                        continue
-                    except Exception as e:
-                        raise RuntimeError(f"recv failed for {app_id}: {e}") from e
-                    misses = 0
-
-                    if reply.get("error"):
-                        continue  # not installed / unknown id - skip silently
-                    result = reply.get("result")
-                    if not result:
-                        continue
-                    app_info = {
-                        "appId": result.get("id", app_id),
-                        "name": result.get("name"),
-                        "running": bool(result.get("running")),
-                        "visible": bool(result.get("visible")),
-                        "version": result.get("version"),
-                    }
-                    installed.append(app_info)
-                    if app_info["visible"]:
-                        running_app = app_info
-
-                # Do NOT fall back to "running" here. A backgrounded app keeps
-                # running=true after another app takes the screen, so this fallback
-                # reported a stale app as the current one — it made the Casa watchdog
-                # read YouTube (111299001912) right after a relaunch and announce a
-                # restore failure that had not happened. Only `visible` is the screen.
-
-                power = get_power_state()
-                if not power and running_app and running_app.get("visible"):
-                    power = "on"  # REST blanked PowerState but an app is visibly running
-                # Only live evidence may move the cache (see _ws_power_note); REST is
-                # carried in the snapshot for display, never written on its own.
-                _note_power(_ws_power_note(running_app, power))
-                state.update(installed, running_app, power=power)
-
-                for _ in range(POLL_INTERVAL * 2):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(0.5)
-        except Exception as e:
-            state.update(
-                state.snapshot()["installed_apps"],
-                state.snapshot()["running_app"],
-                power=get_power_state(),
-                error=str(e),
-            )
-            # ponytail: back off 60s instead of 3s when the *connect* failed. Every
-            # reconnect attempt makes the TV raise an "Allow this device?" dialog, so a
-            # 3s retry loop turns a standby set into a prompt storm. A failure on a
-            # socket that had already connected is not that: it is a dropped read, and
-            # 60 s of blindness is what made the card lag by a minute.
-            for _ in range(int(_retry_delay(connected) / 0.5)):
-                if stop_event.is_set():
-                    break
-                time.sleep(0.5)
-        finally:
-            if ws is not None:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
+        installed, running, err = poll_apps()
+        power = _read_power_now() or ("on" if running else "standby")
+        if running and running.get("visible"):
+            power = "on"
+        _note_power("on" if power == "on" else "standby")
+        state.update(installed, running, power=power, error=err)
+        for _ in range(int(POLL_INTERVAL / 0.5)):
+            if stop_event.is_set():
+                break
+            time.sleep(0.5)
 
 
 # ---- control actions -------------------------------------------------------
