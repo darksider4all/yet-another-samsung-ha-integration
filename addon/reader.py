@@ -622,6 +622,42 @@ def _effective_power(snap):
     return _POWER_CACHE or "off"
 
 
+def _wake_on_lan(bursts: int = 10, interval: float = 1.0) -> bool:
+    """Magic packet to the set, broadcast + unicast. Returns True if it was sent.
+
+    Measured 2026-10-24 on the DU85: after a real power-off the TV stops answering
+    :8001/:8002/:26101 entirely (deep standby) and only WoL brings it back — one
+    packet was not enough, a 10-packet burst over 10 s woke it in ~3 s. This is the
+    only wake path that does not need the pairing token, so it is tried first.
+    """
+    mac = (_cfg("tv_mac", "") or "").replace(":", "").replace("-", "").strip()
+    if len(mac) != 12:
+        return False
+    try:
+        pkt = b"\xff" * 6 + bytes.fromhex(mac) * 16
+    except ValueError:
+        return False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except OSError:
+        return False
+    try:
+        for i in range(max(1, bursts)):
+            for dst in ("255.255.255.255", _cfg("tv_ip", "")):
+                if not dst:
+                    continue
+                try:
+                    s.sendto(pkt, (dst, 9))
+                except OSError:
+                    pass
+            if i + 1 < bursts:
+                time.sleep(interval)
+        return True
+    finally:
+        s.close()
+
+
 def _read_power_now() -> str | None:
     """REST PowerState read *now*, normalised to 'on'/'standby', None if unreachable.
 
@@ -922,14 +958,31 @@ def control_power_on() -> dict:
     # would switch it ON-to-OFF or OFF-to-ON with equal confidence. Refuse instead.
     if power not in ("standby", "off"):
         return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
-    if _send_remote_key("KEY_POWER") is False:
-        # _send_remote_key is the only place an ms.error refusal is visible; ignoring
-        # it reported a wake that the TV had just rejected.
-        return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
-    ok = _verify_power("on")
+    # Wake-on-LAN first: it is the only path that needs no pairing token, so a lost
+    # token no longer means "cannot turn the TV on". A set in deep standby answers
+    # no socket at all, and the WS key cannot reach it.
+    method = None
+    sent = False
+    if _wake_on_lan():
+        sent = True
+        method = "wol"
+        ok = _verify_power("on", tries=12, delay=1.0)
+    else:
+        ok = False
+    if not ok:
+        # Standby (not deep sleep): the remote channel still answers, so a key works.
+        if _send_remote_key("KEY_POWER") is False:
+            # _send_remote_key is the only place an ms.error refusal is visible;
+            # ignoring it reported a wake that the TV had just rejected.
+            if not sent:
+                return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
+        else:
+            sent = True
+            method = "wol+key" if method else "key"
+            ok = _verify_power("on")
     if ok:
         _note_power("on", deliberate=True)
-    return {"sent": True, "power": power, "reason": None, "verified": ok}
+    return {"sent": sent, "power": power, "reason": None, "verified": ok, "method": method}
 
 
 def _remote_url(token=""):
