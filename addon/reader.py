@@ -622,6 +622,30 @@ def _effective_power(snap):
     return _POWER_CACHE or "off"
 
 
+def _read_power_now() -> str | None:
+    """REST PowerState read *now*, normalised to 'on'/'standby', None if unreachable.
+
+    Called immediately before a toggle: the cache only knows what WE last did, so a
+    viewer who switched the set on with the remote left it saying 'standby' — and
+    KEY_POWER is a blind toggle, which then switched the TV off instead of on.
+    Measured 2026-10-24: 10/10 correct 'on' reads over 20 s while the set was lit.
+    """
+    p = get_power_state()
+    if not p:
+        return None
+    return "on" if p == "on" else "standby"
+
+
+def _verify_power(want: str, tries: int = 6, delay: float = 0.7) -> bool:
+    """Did the toggle actually land? Polls REST for ~4 s. A key is never acked, so
+    this is the only proof that 'sent' also meant 'happened'."""
+    for _ in range(tries):
+        time.sleep(delay)
+        if _read_power_now() == want:
+            return True
+    return False
+
+
 def _ws_power_note(running_app, power):
     """Which power inference the WS poller may record, or None to record nothing.
 
@@ -890,19 +914,22 @@ def control_power_on() -> dict:
     sent because we thought it was already on" indistinguishable from a real wake.
     'sent' means the frame left the bridge - the TV never acks a keypress, so a
     silent socket still reads as sent; only an explicit ms.error is a send_failed."""
-    power = _POWER_CACHE
+    power = _read_power_now() or _POWER_CACHE   # live read first; cache is the fallback
     if power == "on":
-        return {"sent": False, "power": power, "reason": "already_on"}
+        _note_power("on")
+        return {"sent": False, "power": power, "reason": "already_on", "verified": True}
     # KEY_POWER is a blind toggle: if we are not *sure* the set is off, sending it
     # would switch it ON-to-OFF or OFF-to-ON with equal confidence. Refuse instead.
     if power not in ("standby", "off"):
-        return {"sent": False, "power": power, "reason": "power_unknown"}
+        return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
     if _send_remote_key("KEY_POWER") is False:
         # _send_remote_key is the only place an ms.error refusal is visible; ignoring
         # it reported a wake that the TV had just rejected.
-        return {"sent": False, "power": power, "reason": "send_failed"}
-    _note_power("on", deliberate=True)
-    return {"sent": True, "power": power, "reason": None}
+        return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
+    ok = _verify_power("on")
+    if ok:
+        _note_power("on", deliberate=True)
+    return {"sent": True, "power": power, "reason": None, "verified": ok}
 
 
 def _remote_url(token=""):
@@ -1020,19 +1047,22 @@ def control_power_off() -> dict:
     the caller. Still idempotent: KEY_POWER is a toggle, so standby/off is never sent
     again, and an unknown power state is refused rather than guessed - guessing could
     switch the TV ON."""
-    power = _POWER_CACHE
+    power = _read_power_now() or _POWER_CACHE   # live read first; cache is the fallback
     if power in ("standby", "off"):
-        return {"sent": False, "power": power, "reason": "already_off"}
+        _note_power("standby")
+        return {"sent": False, "power": power, "reason": "already_off", "verified": True}
     if power != "on":
-        return {"sent": False, "power": power, "reason": "power_unknown"}
+        return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
     # No token guard here on purpose: the first unpaired press is how the TV is asked
     # for permission, and _send_remote_key adopts the token it returns.
     if _send_remote_key("KEY_POWER") is False:
-        return {"sent": False, "power": power, "reason": "send_failed"}
+        return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
     # deliberate: locks the cache so the poller cannot snap it back to "on" and
     # let a second turn_off flip the set back on
-    _note_power("standby", deliberate=True)
-    return {"sent": True, "power": power, "reason": None}
+    ok = _verify_power("standby")
+    if ok:
+        _note_power("standby", deliberate=True)
+    return {"sent": True, "power": power, "reason": None, "verified": ok}
 
 
 # Server-side control actions. Everything the on-TV agent handles (volume, mute,
@@ -1583,6 +1613,15 @@ def make_handler(state: TVState):
             if self.path == "/v1/state":
                 snap = state.snapshot()
                 snap["agent"] = _AGENT.snapshot()
+                # Live-TV data belongs to live TV. While a real app is visible the
+                # agent's last channel/program is archaeology — it was "PRO TV HD" /
+                # "Vocea Romaniei" next to a playing YouTube — so drop it now instead
+                # of waiting the 300 s silence rule (the agent cannot report while it
+                # is not the foreground app, so silence is the normal case).
+                if (snap.get("running_app") or {}).get("visible"):
+                    snap["agent"]["channel"] = None
+                    snap["agent"]["program"] = None
+                    snap["agent"]["input"] = None
                 # The agent goes quiet while a real app is foreground, and older HA
                 # entities read only agent.foregroundApp. Fill it from the live WS poll
                 # so the entity can name the app (and pick its artwork) either way.

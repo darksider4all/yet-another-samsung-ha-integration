@@ -45,11 +45,16 @@ class PowerOffContract(unittest.TestCase):
         # never touch a real TV from a test
         self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
         self.m.TV_TOKEN = "token"
+        # Offline and deterministic: the fresh REST read the power path now does is
+        # stubbed from the cache the test sets, and a sent toggle is assumed to land
+        # unless the test says otherwise.
+        self.m._read_power_now = lambda: self.m._POWER_CACHE
+        self.m._verify_power = lambda want, tries=6, delay=0.7: True
 
     def test_sends_when_on(self):
         self.m._POWER_CACHE = "on"
         self.assertEqual(
-            self.m.control_power_off(), {"sent": True, "power": "on", "reason": None}
+            self.m.control_power_off(), {"sent": True, "power": "on", "reason": None, "verified": True}
         )
         self.assertEqual(self.sent, ["KEY_POWER"])
 
@@ -82,7 +87,7 @@ class PowerOffContract(unittest.TestCase):
         self.m._send_remote_key = lambda key: False
         self.m._POWER_CACHE = "on"
         result = self.m.control_power_off()
-        self.assertEqual(result, {"sent": False, "power": "on", "reason": "send_failed"})
+        self.assertEqual(result, {"sent": False, "power": "on", "reason": "send_failed", "verified": False})
         self.assertEqual(self.m._POWER_CACHE, "on", "a refused key changed no state")
 
     def test_deliberate_standby_survives_a_poller_write(self):
@@ -116,11 +121,16 @@ class PowerOnContract(unittest.TestCase):
         self.sent = []
         self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
         self.m.TV_TOKEN = "token"
+        # Offline and deterministic: the fresh REST read the power path now does is
+        # stubbed from the cache the test sets, and a sent toggle is assumed to land
+        # unless the test says otherwise.
+        self.m._read_power_now = lambda: self.m._POWER_CACHE
+        self.m._verify_power = lambda want, tries=6, delay=0.7: True
 
     def test_sends_when_off(self):
         self.m._POWER_CACHE = "standby"
         self.assertEqual(
-            self.m.control_power_on(), {"sent": True, "power": "standby", "reason": None}
+            self.m.control_power_on(), {"sent": True, "power": "standby", "reason": None, "verified": True}
         )
         self.assertEqual(self.sent, ["KEY_POWER"])
 
@@ -144,7 +154,7 @@ class PowerOnContract(unittest.TestCase):
         self.m._send_remote_key = lambda key: False
         self.m._POWER_CACHE = "standby"
         result = self.m.control_power_on()
-        self.assertEqual(result, {"sent": False, "power": "standby", "reason": "send_failed"})
+        self.assertEqual(result, {"sent": False, "power": "standby", "reason": "send_failed", "verified": False})
         self.assertEqual(self.m._POWER_CACHE, "standby", "a refused key changed no state")
 
 
@@ -181,3 +191,46 @@ class StandbyPrimingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PowerTruthContract(unittest.TestCase):
+    """The set's real state must beat our cache: a viewer who switches the TV on with
+    the remote leaves the cache saying 'standby', and KEY_POWER is a blind toggle."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.sent = []
+        self.m._send_remote_key = lambda key: (self.sent.append(key), True)[1]
+        self.m.TV_TOKEN = "token"
+        self.m._verify_power = lambda want, tries=6, delay=0.7: True
+
+    def test_stale_cache_standby_rest_on_sends_nothing(self):
+        self.m._POWER_CACHE = "standby"
+        self.m._read_power_now = lambda: "on"
+        result = self.m.control_power_on()
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "already_on")
+        self.assertEqual(self.sent, [], "a blind toggle here switched the TV off")
+
+    def test_stale_cache_on_rest_standby_sends_nothing_off(self):
+        self.m._POWER_CACHE = "on"
+        self.m._read_power_now = lambda: "standby"
+        result = self.m.control_power_off()
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "already_off")
+        self.assertEqual(self.sent, [])
+
+    def test_toggle_that_does_not_land_is_not_claimed(self):
+        self.m._POWER_CACHE = "standby"
+        self.m._read_power_now = lambda: "standby"
+        self.m._verify_power = lambda want, tries=6, delay=0.7: False
+        result = self.m.control_power_on()
+        self.assertTrue(result["sent"])
+        self.assertFalse(result["verified"], "a key is never acked: only the poll proves it")
+        self.assertEqual(self.m._POWER_CACHE, "standby", "an unverified toggle must not lock the cache")
+
+    def test_rest_unreachable_falls_back_to_the_cache(self):
+        self.m._POWER_CACHE = "standby"
+        self.m._read_power_now = lambda: None
+        result = self.m.control_power_on()
+        self.assertTrue(result["sent"])
