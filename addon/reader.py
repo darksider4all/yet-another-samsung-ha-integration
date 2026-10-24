@@ -1129,11 +1129,17 @@ def control_power_off() -> dict:
         return {"sent": False, "power": power, "reason": "power_unknown", "verified": False}
     # No token guard here on purpose: the first unpaired press is how the TV is asked
     # for permission, and _send_remote_key adopts the token it returns.
+    # The card is corrected BEFORE the key goes out: opening the remote channel costs a
+    # TLS handshake (~5 s on this set), and leaving the old app on screen for that long
+    # after the viewer pressed off is exactly the reported bug. A refused send restores it.
+    prev = _STATE.snapshot() if _STATE is not None else {}
+    clear_running_app("standby")
     if _send_remote_key("KEY_POWER") is False:
+        if _STATE is not None:
+            _STATE.update(prev.get("installed_apps") or [], prev.get("running_app"), power="on")
         return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
     # deliberate: locks the cache so the poller cannot snap it back to "on" and
     # let a second turn_off flip the set back on
-    clear_running_app("standby")
     ok = _verify_power("standby", tries=4, delay=0.5)   # ~2 s: the set answers while lit
     _note_power("standby", deliberate=True)
     return {"sent": True, "power": power, "reason": None, "verified": ok}

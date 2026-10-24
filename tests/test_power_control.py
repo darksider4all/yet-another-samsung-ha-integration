@@ -382,3 +382,23 @@ class PowerOffClearsAppContract(unittest.TestCase):
     def test_no_state_object_is_not_a_crash(self):
         self.m._STATE = None
         self.m.control_power_off()   # must not raise
+
+
+class FailedSendRestoresTheApp(unittest.TestCase):
+    """Clearing the card before the key is honest only if a refusal puts it back."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.m._read_power_now = lambda: "on"
+        self.m._verify_power = lambda *a, **k: True
+        self.state = self.m.TVState()
+        self.app = {"appId": "3201907018807", "name": "Netflix", "visible": True}
+        self.state.update([self.app], self.app, power="on")
+        self.m._STATE = self.state
+
+    def test_refused_key_restores_the_app(self):
+        self.m._send_remote_key = lambda key: False
+        self.m.control_power_off()
+        snap = self.state.snapshot()
+        self.assertEqual((snap["running_app"] or {}).get("name"), "Netflix")
+        self.assertEqual(snap["power"], "on")
