@@ -739,6 +739,20 @@ class TVState:
             }
 
 
+STALE_AFTER = 20.0   # seconds a poll snapshot may be believed
+
+
+def _snapshot_age(snap) -> float:
+    """Age of the last poll in seconds, or a big number when it has no timestamp."""
+    ts = (snap or {}).get("timestamp")
+    if not ts:
+        return 1e9
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+    except Exception:
+        return 1e9
+
+
 def _retry_delay(connected: bool) -> float:
     """How long to stay off the TV's socket after a poll failure.
 
@@ -1691,7 +1705,21 @@ def make_handler(state: TVState):
             _note_request(self.path)
             if self.path == "/v1/state":
                 snap = state.snapshot()
+                # A frozen poll must not be replayed as the truth. When the poller backs
+                # off, the snapshot keeps its last values forever, which is how a set in
+                # standby still read "on, YouTube" 50 s later. Old snapshot: no app
+                # claim, and power decided by a live REST read (a set that answers
+                # nothing at all is off, not on).
+                if _snapshot_age(snap) > STALE_AFTER:
+                    snap["running_app"] = None
+                    _live = _read_power_now()
+                    snap["power"] = _live or "standby"
+                    if not snap.get("last_error"):
+                        snap["last_error"] = f"poll stale ({_snapshot_age(snap):.0f}s)"
                 snap["agent"] = _AGENT.snapshot()
+                if _snapshot_age(state.snapshot()) > STALE_AFTER:
+                    # the agent's last foreground app is just as stale as the poll
+                    snap["agent"]["foregroundApp"] = None
                 # Live-TV data belongs to live TV. While a real app is visible the
                 # agent's last channel/program is archaeology — it was "PRO TV HD" /
                 # "Vocea Romaniei" next to a playing YouTube — so drop it now instead
