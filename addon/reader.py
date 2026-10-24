@@ -625,6 +625,24 @@ def _effective_power(snap):
     return _POWER_CACHE or "off"
 
 
+_STATE = None   # the live TVState, set in main(); power commands correct it directly
+
+
+def clear_running_app(power=None):
+    """Drop the app claim the moment the screen goes off.
+
+    Reported: after turn_off the card kept showing the previous app for 5-6 s. The
+    poller only refreshes every 2 s (30 s while off), so the last snapshot — app
+    included — was served in the meantime. A deliberate power command knows better
+    than the poll does, so it says so at once.
+    """
+    if _STATE is None:
+        return
+    snap = _STATE.snapshot()
+    _STATE.update(snap.get("installed_apps") or [], None,
+                  power=power if power is not None else snap.get("power"))
+
+
 def _wake_on_lan(bursts: int = 3, interval: float = 0.5) -> bool:
     """Magic packet to the set, broadcast + unicast. Returns True if it was sent.
 
@@ -1115,9 +1133,9 @@ def control_power_off() -> dict:
         return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
     # deliberate: locks the cache so the poller cannot snap it back to "on" and
     # let a second turn_off flip the set back on
+    clear_running_app("standby")
     ok = _verify_power("standby", tries=4, delay=0.5)   # ~2 s: the set answers while lit
-    if ok:
-        _note_power("standby", deliberate=True)
+    _note_power("standby", deliberate=True)
     return {"sent": True, "power": power, "reason": None, "verified": ok}
 
 
@@ -2028,7 +2046,9 @@ def make_handler(state: TVState):
 
 
 def main():
+    global _STATE
     state = TVState()
+    _STATE = state
     stop_event = threading.Event()
 
     holder = {}

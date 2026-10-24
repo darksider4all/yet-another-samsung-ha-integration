@@ -352,3 +352,33 @@ class PollerWatchdogContract(unittest.TestCase):
         th.join(timeout=2)
         self.assertGreater(calls["n"], 0, "the poll loop died on the first error")
         self.assertIn("tv rebooted", (st.snapshot().get("last_error") or ""))
+
+
+class PowerOffClearsAppContract(unittest.TestCase):
+    """Reported: after turn_off the card kept the previous app for 5-6 s, because the
+    poller only refreshes every 2 s (30 s while off)."""
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.m._send_remote_key = lambda key: True
+        self.m._verify_power = lambda want, tries=4, delay=0.5: True
+        self.m._read_power_now = lambda: "on"
+        self.state = self.m.TVState()
+        self.state.update([{"appId": "3201907018807", "name": "Netflix", "visible": True}],
+                          {"appId": "3201907018807", "name": "Netflix", "visible": True},
+                          power="on")
+        self.m._STATE = self.state
+
+    def test_app_is_dropped_the_instant_the_key_is_off(self):
+        self.m.control_power_off()
+        snap = self.state.snapshot()
+        self.assertIsNone(snap["running_app"], "the card would keep showing Netflix")
+        self.assertEqual(snap["power"], "standby")
+
+    def test_the_app_list_is_kept(self):
+        self.m.control_power_off()
+        self.assertEqual(len(self.state.snapshot()["installed_apps"]), 1)
+
+    def test_no_state_object_is_not_a_crash(self):
+        self.m._STATE = None
+        self.m.control_power_off()   # must not raise
