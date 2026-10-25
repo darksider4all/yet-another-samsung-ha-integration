@@ -18,8 +18,11 @@ firmware T-NKLDDEUC-0090-2123.9 - see FINISH_READER_DOCKET.md):
     "params":{"id":<appId>}} -> {"id":...,"result":{"id","name","running",
     "visible","version"}} for installed apps, or {"error":{"code":404}} for
     unknown ids. "visible":true = foreground app.
-  - wss://<tv>:8002/api/v2/channels/samsung.remote.control?name=<b64>&token=<tok>
-    is the paired "remote" channel used for key presses (ms.remote.control).
+  - wss://<tv>:8002/api/v3/channels/samsung.remote.control?name=<b64> is the remote
+    channel used for key presses (ms.remote.control). v3 needs no token; v2 answers
+    ms.channel.timeOut and closes 1005 "notack" when pairing was never acknowledged
+    (measured 2026-10-25). The same channel does NOT wake the set from standby —
+    WoL remains the only wake path.
   - The token-less ed.installedApp.get "list all apps" event is DEAD on this
     firmware (silently dropped), so the installed-app list is a *candidate
     probe* over CANDIDATE_APP_IDS; names/versions always come live from the TV.
@@ -1037,10 +1040,9 @@ def control_power_on() -> dict:
         # and needs no token, so it is the cheap insurance the ordering was missing.
         woke = _wake_on_lan(bursts=3, interval=0.5)
         if _send_remote_key("KEY_POWER") is False:
-            # REST answered, so the set is reachable: a refused key is a pairing
-            # problem, not a dead TV. Say that, so HA can show something fixable
-            # instead of a silent miss ("send_failed" hid it).
-            return {"sent": False, "power": power, "reason": "needs_pairing", "verified": False}
+            # REST answered and the key was still refused: with v3 there is no
+            # pairing to blame, so this is a send failure, reported as one.
+            return {"sent": False, "power": power, "reason": "send_failed", "verified": False}
         _arm_verify("on", gen=gen)
         return {"sent": True, "power": power, "reason": None, "verified": False,
                 "method": "wol+key" if woke else "key", "pending": True}
@@ -1056,7 +1058,12 @@ def _remote_url(token=""):
     q = f"name={_b64(CLIENT_NAME)}"
     if token:
         q += f"&token={token}"
-    return f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v2/channels/samsung.remote.control?{q}"
+    # v3, deliberately token-free: measured 2026-10-25, v2 answers ms.channel.timeOut
+    # and closes with the reserved code 1005 ("notack") when the pairing was never
+    # acknowledged, which every client library reports as a framing error. v3 accepts
+    # the same request with no token at all and delivers keys while the set is awake.
+    # The token is still passed when we have one, purely for older firmware.
+    return f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v3/channels/samsung.remote.control?{q}"
 
 
 def control_pair(timeout=45) -> str:
@@ -1688,6 +1695,36 @@ def _poke_ha_state(delay: float = 0.0):
 
 AGENT_ACTIONS = {"volume_up", "volume_down", "set_volume", "mute",
                  "channel_up", "channel_down", "tune_channel", "notify", "hide"}
+
+# What each agent action needs in its payload. Until 2026-10-25 the bridge accepted
+# {"action":"mute","mute":true} and answered {"ok": true} — the TV did nothing (the
+# real key is "value") and the caller was told it worked. A no-op dressed as success is
+# the same class of lie as the reserved 1005 close code, so a malformed payload is now
+# refused with the shape it expected.
+AGENT_ACTION_ARGS = {
+    "set_volume": ("value", "number"),
+    "mute": ("value", "boolean"),
+    "tune_channel": ("value", "string"),
+    "notify": ("message", "string"),
+}
+
+
+def validate_agent_action(body: dict) -> str | None:
+    """The error message for an unusable payload, or None when it is fine."""
+    spec = AGENT_ACTION_ARGS.get(str(body.get("action") or ""))
+    if spec is None:
+        return None
+    key, kind = spec
+    if key not in body:
+        return f"{body.get('action')} needs '{key}' ({kind})"
+    val = body[key]
+    if kind == "boolean" and not isinstance(val, bool):
+        return f"{body.get('action')} needs '{key}' as boolean, got {type(val).__name__}"
+    if kind == "number" and (isinstance(val, bool) or not isinstance(val, (int, float))):
+        return f"{body.get('action')} needs '{key}' as a number, got {type(val).__name__}"
+    if kind == "string" and not isinstance(val, str):
+        return f"{body.get('action')} needs '{key}' as a string, got {type(val).__name__}"
+    return None
 # launch_app is deliberately NOT an agent action: a hidden Tizen app has its
 # timers suspended, so handing a "launch yourself" command to it can never work.
 # It must run bridge-side through CONTROL_ACTIONS, which talks to the TV's REST API.
@@ -2096,6 +2133,12 @@ def make_handler(state: TVState):
                 body = json.loads(self.rfile.read(n) or b"{}")
                 action = body.get("action")
                 if action in AGENT_ACTIONS:
+                    # Refuse a payload the agent cannot act on, before it is queued:
+                    # a silent no-op answered with {"ok": true} is worse than an error.
+                    problem = validate_agent_action(body)
+                    if problem:
+                        self._send(400, json.dumps({"error": "bad_payload", "message": problem}).encode("utf-8"), "application/json")
+                        return
                     # Reliable path: hand to the on-TV agent (executes via Tizen APIs)
                     enqueue_command(body)
                     # Force HA to re-read the bridge right after a state-changing

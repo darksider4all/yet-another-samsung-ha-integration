@@ -222,6 +222,30 @@ class NotifyLaunchesAgentTest(BridgeTest):
         self.assertTrue(diag["toast_pending"])
 
 
+class AgentPayloadHttpTest(BridgeTest):
+    """A malformed agent payload used to answer {"ok": true} while the TV did nothing:
+    {"action":"mute","mute":true} instead of {"value":true}. Over HTTP it is now a 400."""
+
+    def test_malformed_mute_is_400_not_ok(self):
+        from urllib.error import HTTPError
+        with self.assertRaises(HTTPError) as ctx:
+            self.post("/v1/control", {"action": "mute", "mute": True})
+        self.assertEqual(ctx.exception.code, 400)
+        body = json.loads(ctx.exception.read().decode() or "{}")
+        self.assertEqual(body.get("error"), "bad_payload")
+        self.assertIn("value", body.get("message", ""))
+
+    def test_queue_does_not_grow_from_a_refused_payload(self):
+        from urllib.error import HTTPError
+        before = len(getattr(self.mod, "_cmd_queue", []))
+        try:
+            self.post("/v1/control", {"action": "mute", "mute": True})
+        except HTTPError:
+            pass
+        self.assertEqual(len(getattr(self.mod, "_cmd_queue", [])), before,
+                         "a refused payload must never reach the agent queue")
+
+
 class PowerOnHttpTest(BridgeTest):
     """Over HTTP: a turn_on the bridge refuses must be a refusal, not a 200 that HA
     reads as success. power_on used to answer `ok: true` for every call."""
@@ -274,8 +298,8 @@ class PowerOnHttpTest(BridgeTest):
         self.assertEqual(ctx.exception.code, 409)
         body = json.loads(ctx.exception.read().decode() or "{}")
         self.assertFalse(body["ok"])
-        # REST answered, so the refusal is the pairing, not the network (2026-10-24).
-        self.assertEqual(body["reason"], "needs_pairing")
+        # REST answered and v3 needs no pairing: the refusal is a send failure.
+        self.assertEqual(body["reason"], "send_failed")
         self.assertEqual(self.mod._POWER_CACHE, "standby", "a refused key changed no state")
 
 
