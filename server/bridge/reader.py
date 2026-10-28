@@ -688,6 +688,9 @@ def _wake_on_lan(bursts: int = 3, interval: float = 0.5) -> bool:
         s.close()
 
 
+_LAST_READ_ANSWERED = False   # did the last REST read get any answer at all?
+
+
 def _read_power_now() -> str | None:
     """REST PowerState read *now*, normalised to 'on'/'standby', None if unreachable.
 
@@ -746,10 +749,13 @@ def get_power_state() -> str | None:
     """Read PowerState from the REST device info (local, no auth). Caches the last
     non-empty value; returns None on failure/empty so callers keep the last good one."""
     try:
+        global _LAST_READ_ANSWERED
         dev = json.loads(_rest_request(""))["device"]
         _DEVICE_CACHE.update(ip=_cfg("tv_ip", ""), device=dev, ts=time.time())
+        _LAST_READ_ANSWERED = True   # it answered, even if PowerState is ""
         return dev.get("PowerState") or None
     except Exception:
+        _LAST_READ_ANSWERED = False  # silence: deep standby, WoL only
         return None
 
 
@@ -1029,11 +1035,14 @@ def control_power_on() -> dict:
     the 20-80 s a full wake can take.
     """
     power = _read_power_now()
+    # An empty PowerState is still an answer: this firmware reports "" in network
+    # standby, where WoL does nothing and KEY_POWER wakes the set in ~4 s (2026-10-28).
+    answered = power is not None or _LAST_READ_ANSWERED
     if power == "on":
         _note_power("on")
         return {"sent": False, "power": power, "reason": "already_on", "verified": True}
     gen = bump_power_gen()
-    if power is not None:                      # it answered: network standby
+    if answered:                               # it answered: network standby
         # A burst first even though the set answers. Two measured reasons (2026-10-24):
         # REST can answer while the radio is half asleep, and a set in network standby
         # can still refuse the key when the pairing went stale — the burst costs ~1.5 s
