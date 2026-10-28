@@ -579,3 +579,52 @@ class PayloadValidationContract(unittest.TestCase):
     def test_actions_without_required_args_are_untouched(self):
         self.assertIsNone(self.m.validate_agent_action({"action": "volume_up"}))
         self.assertIsNone(self.m.validate_agent_action({"action": "nope"}))
+"""Appended to tests/test_power_control.py — network standby vs deep standby.
+
+Measured 2026-10-28 on the DU8572: in network standby the set answers :8001 but reports
+PowerState "". WoL does nothing there; KEY_POWER wakes it in ~4 s. A set that answers
+nothing is in deep standby, where WoL is the only route in. _read_power_now() folds an
+empty PowerState into None, so without the answered flag both states look identical and
+the set never receives the key.
+"""
+
+
+class NetworkStandbyWake(unittest.TestCase):
+    def setUp(self):
+        self.m = _load_reader()
+        self.keys, self.wols = [], []
+        self.m._send_remote_key = lambda key: (self.keys.append(key), True)[1]
+        self.m._wake_on_lan = lambda *a, **k: (self.wols.append(k.get("bursts", 1)), True)[1]
+        self.m._arm_verify = lambda *a, **k: None
+        self.m._note_power = lambda *_a, **_k: None
+        self.m.TV_TOKEN = "token"
+
+    def _read(self, power, answered):
+        self.m._read_power_now = lambda: power
+        self.m._LAST_READ_ANSWERED = answered
+
+    def test_network_standby_sends_the_key(self):
+        self._read(None, True)                # answered, empty PowerState
+        r = self.m.control_power_on()
+        self.assertEqual(self.keys, ["KEY_POWER"], "network standby needs a keypress")
+        self.assertTrue(r["sent"])
+        self.assertEqual(r["method"], "wol+key")
+
+    def test_deep_standby_is_wol_only(self):
+        self._read(None, False)               # silence
+        r = self.m.control_power_on()
+        self.assertEqual(self.keys, [], "an unreachable set cannot take a key")
+        self.assertEqual(len(self.wols), 1, "WoL is the only route into deep standby")
+        self.assertEqual(r["method"], "wol")
+
+    def test_standby_that_answered_sends_the_key(self):
+        self._read("standby", True)
+        r = self.m.control_power_on()
+        self.assertEqual(self.keys, ["KEY_POWER"])
+        self.assertEqual(r["method"], "wol+key")
+
+    def test_already_on_touches_nothing(self):
+        self._read("on", True)
+        r = self.m.control_power_on()
+        self.assertEqual((self.keys, self.wols), ([], []), "KEY_POWER is a blind toggle")
+        self.assertEqual(r.get("reason"), "already_on")
