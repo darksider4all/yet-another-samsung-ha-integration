@@ -106,13 +106,16 @@ class PowerOffContract(unittest.TestCase):
         self.assertEqual(self.m._POWER_CACHE, "standby", "poller clobbered a command")
 
     def test_remote_channel_wire_format(self):
-        """Pin port and path: the 1005 red herring was a wrong-port attempt (:8009)."""
+        """Pin port and path. Measured 2026-10-25: v2 answers ms.channel.timeOut and
+        closes with the reserved 1005 "notack" when the pairing was never acknowledged
+        (reported by every client library as a framing error), while v3 connects with
+        no token at all and delivers keys while the set is awake."""
         self.m.CLIENT_NAME = "yast-bridge"
         self.m._cfg = lambda k, d=None: "192.168.0.154" if k == "tv_ip" else d
         url = self.m._remote_url("abc123")
         self.assertTrue(url.startswith("wss://192.168.0.154:8002/"), url)
-        self.assertIn("/api/v2/channels/samsung.remote.control?", url)
-        self.assertIn("token=abc123", url)
+        self.assertIn("/api/v3/channels/samsung.remote.control?", url)
+        self.assertIn("token=abc123", url, "still offered for older firmware")
 
 
 class PowerOnContract(unittest.TestCase):
@@ -156,12 +159,25 @@ class PowerOnContract(unittest.TestCase):
 
     def test_a_refused_send_is_not_reported_as_a_wake(self):
         """_send_remote_key returns False on an explicit ms.error; ignoring it made a
-        rejected key read as a successful wake and poisoned the cache with 'on'."""
+        rejected key read as a successful wake and poisoned the cache with 'on'.
+        REST answered and v3 has no pairing, so the refusal is a send failure."""
         self.m._send_remote_key = lambda key: False
         self.m._POWER_CACHE = "standby"
         result = self.m.control_power_on()
         self.assertEqual(result, {"sent": False, "power": "standby", "reason": "send_failed", "verified": False})
         self.assertEqual(self.m._POWER_CACHE, "standby", "a refused key changed no state")
+
+    def test_the_burst_goes_out_before_the_key(self):
+        """A set that answers REST can still refuse the key with a stale pairing, so the
+        (token-free, ~1.5 s) burst goes first — order is the whole point."""
+        order = []
+        self.m._wake_on_lan = lambda *a, **k: (order.append("wol"), True)[1]
+        self.m._send_remote_key = lambda key: (order.append("key"), True)[1]
+        self.m._POWER_CACHE = "standby"
+        result = self.m.control_power_on()
+        self.assertEqual(order, ["wol", "key"])
+        self.assertEqual(result["method"], "wol+key")
+        self.assertTrue(result["pending"])
 
 
 
@@ -235,10 +251,11 @@ class WakeOnLanContract(unittest.TestCase):
         self.assertTrue(result["pending"], "verification is deferred so HA does not time out")
         self.assertEqual(self.sent, [], "no key: the wake path must not need pairing")
 
-    def test_a_set_that_answers_is_woken_by_key(self):
+    def test_a_set_that_answers_is_woken_by_burst_then_key(self):
         self.m._read_power_now = lambda: "standby"
+        self.m._wake_on_lan = lambda *a, **k: True   # never a real packet from a test
         result = self.m.control_power_on()
-        self.assertEqual(result["method"], "key")
+        self.assertEqual(result["method"], "wol+key")
         self.assertEqual(self.sent, ["KEY_POWER"])
 
     def test_no_wol_and_no_answer_is_a_refusal(self):
@@ -537,3 +554,28 @@ class NotifyRestoresPreviousApp(unittest.TestCase):
         import time as _t
         _t.sleep(3.5)
         self.assertNotIn("111299001912", self.launched, "we fought the viewer")
+
+class PayloadValidationContract(unittest.TestCase):
+    """The bridge answered {"ok": true} to {"action":"mute","mute":true} while doing
+    nothing (the real key is "value") — a no-op dressed as success, the same lie the
+    reserved 1005 close code told. Malformed payloads are refused now, with the shape."""
+
+    def setUp(self):
+        self.m = _load_reader()
+
+    def test_the_wrong_key_is_refused(self):
+        msg = self.m.validate_agent_action({"action": "mute", "mute": True})
+        self.assertIn("value", msg)
+
+    def test_the_right_shape_passes(self):
+        self.assertIsNone(self.m.validate_agent_action({"action": "mute", "value": True}))
+        self.assertIsNone(self.m.validate_agent_action({"action": "set_volume", "value": 12}))
+
+    def test_a_type_mismatch_is_refused(self):
+        self.assertIsNotNone(self.m.validate_agent_action({"action": "mute", "value": "yes"}))
+        self.assertIsNotNone(self.m.validate_agent_action({"action": "set_volume", "value": True}),
+                             "a boolean is not a volume")
+
+    def test_actions_without_required_args_are_untouched(self):
+        self.assertIsNone(self.m.validate_agent_action({"action": "volume_up"}))
+        self.assertIsNone(self.m.validate_agent_action({"action": "nope"}))
