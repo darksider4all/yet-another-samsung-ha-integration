@@ -4,6 +4,7 @@ Regression: it returned a bare True on a cache miss, so a power-off that never l
 bridge looked identical to a successful one — HA reported success while the TV stayed on.
 """
 import importlib.util
+import json
 import os
 import pathlib
 import sys
@@ -106,16 +107,22 @@ class PowerOffContract(unittest.TestCase):
         self.assertEqual(self.m._POWER_CACHE, "standby", "poller clobbered a command")
 
     def test_remote_channel_wire_format(self):
-        """Pin port and path. Measured 2026-10-25: v2 answers ms.channel.timeOut and
-        closes with the reserved 1005 "notack" when the pairing was never acknowledged
-        (reported by every client library as a framing error), while v3 connects with
-        no token at all and delivers keys while the set is awake."""
+        """Pin port and path. Which api version carries keys is a firmware property:
+        measured 2026-10-25 v2 answered ms.channel.timeOut / 1005 "notack" while v3
+        delivered keys; measured 2026-10-29 the same set accepts keys on v2 and
+        answers ms.error "unrecognized method value" on v3. Both URLs must therefore
+        be buildable, v2 is the default, and the token is still offered."""
         self.m.CLIENT_NAME = "yast-bridge"
         self.m._cfg = lambda k, d=None: "192.168.0.154" if k == "tv_ip" else d
         url = self.m._remote_url("abc123")
         self.assertTrue(url.startswith("wss://192.168.0.154:8002/"), url)
-        self.assertIn("/api/v3/channels/samsung.remote.control?", url)
+        self.assertIn("/api/v2/channels/samsung.remote.control?", url)
         self.assertIn("token=abc123", url, "still offered for older firmware")
+        self.assertIn(
+            "/api/v3/channels/samsung.remote.control?",
+            self.m._remote_url("abc123", "v3"),
+            "v3 stays reachable as the fallback for firmware where v2 times out",
+        )
 
 
 class PowerOnContract(unittest.TestCase):
@@ -628,3 +635,91 @@ class NetworkStandbyWake(unittest.TestCase):
         r = self.m.control_power_on()
         self.assertEqual((self.keys, self.wols), ([], []), "KEY_POWER is a blind toggle")
         self.assertEqual(r.get("reason"), "already_on")
+
+
+class _FakeWS:
+    """A remote channel that greets, then either refuses keys (ms.error) or says
+    nothing at all — which is what a healthy Samsung set does."""
+
+    def __init__(self, refuse):
+        self.refuse = refuse
+        self.sent = []
+        self._greeted = False
+
+    def settimeout(self, _t):
+        pass
+
+    def recv(self):
+        if not self._greeted:
+            self._greeted = True
+            return json.dumps({"event": "ms.channel.connect", "data": {"clients": []}})
+        if self.refuse:
+            return json.dumps({
+                "event": "ms.error",
+                "data": {"message": "unrecognized method value : ms.remote.control"},
+            })
+        raise RuntimeError("timeout")
+
+    def send(self, data):
+        self.sent.append(json.loads(data))
+
+    def close(self):
+        pass
+
+
+class RemoteChannelFallback(unittest.TestCase):
+    """The key channel is a firmware property, not a constant.
+
+    2026-10-25: v3 carried keys, v2 timed out. 2026-10-29 (same set, TIZEN-TRUNK2025):
+    v2 carries keys and v3 answers ms.error "unrecognized method value" — while still
+    completing the handshake. Hard-coding either one silently disables every keypress,
+    which is how power on/off stopped working.
+    """
+
+    def setUp(self):
+        self.m = _load_reader()
+        self.m.TV_TOKEN = "tok"
+        self.opened = []
+
+    def _behaviour(self, table):
+        def _create(url, timeout=None, sslopt=None):
+            api = "v3" if "/api/v3/" in url else "v2"
+            self.opened.append((api, url))
+            return _FakeWS(refuse=table.get(api) == "error")
+
+        self.m.websocket.create_connection = _create
+
+    def test_prefers_v2_and_sends_once(self):
+        self._behaviour({"v2": "ok", "v3": "ok"})
+        self.assertTrue(self.m._send_remote_key("KEY_POWER"))
+        self.assertEqual([a for a, _ in self.opened], ["v2"])
+        self.assertEqual(self.m._REMOTE_API, "v2")
+
+    def test_falls_back_to_v3_when_v2_refuses_the_method(self):
+        self._behaviour({"v2": "error", "v3": "ok"})
+        self.assertTrue(self.m._send_remote_key("KEY_POWER"))
+        self.assertEqual([a for a, _ in self.opened], ["v2", "v3"])
+        self.assertEqual(self.m._REMOTE_API, "v3")
+
+    def test_remembers_the_channel_that_worked(self):
+        self._behaviour({"v2": "ok", "v3": "ok"})
+        self.assertTrue(self.m._send_remote_key("KEY_VOLUP"))
+        self.opened.clear()
+        self.assertTrue(self.m._send_remote_key("KEY_VOLDOWN"))
+        self.assertEqual([a for a, _ in self.opened], ["v2"], "re-probing doubles every keypress")
+
+    def test_refusal_on_both_channels_is_reported(self):
+        self._behaviour({"v2": "error", "v3": "error"})
+        self.assertFalse(self.m._send_remote_key("KEY_POWER"))
+
+    def test_url_shape_defaults_to_v2(self):
+        url = self.m._remote_url("tok")
+        self.assertIn("/api/v2/channels/samsung.remote.control", url)
+        self.assertIn("token=tok", url)
+
+    def test_pairing_only_ever_uses_v2(self):
+        # v3's connect frame never carries a token, so pairing there can only fail
+        self._behaviour({"v2": "ok"})
+        with self.assertRaises(RuntimeError):
+            self.m.control_pair()
+        self.assertEqual([a for a, _ in self.opened], ["v2"])

@@ -18,11 +18,18 @@ firmware T-NKLDDEUC-0090-2123.9 - see FINISH_READER_DOCKET.md):
     "params":{"id":<appId>}} -> {"id":...,"result":{"id","name","running",
     "visible","version"}} for installed apps, or {"error":{"code":404}} for
     unknown ids. "visible":true = foreground app.
-  - wss://<tv>:8002/api/v3/channels/samsung.remote.control?name=<b64> is the remote
-    channel used for key presses (ms.remote.control). v3 needs no token; v2 answers
-    ms.channel.timeOut and closes 1005 "notack" when pairing was never acknowledged
-    (measured 2026-10-25). The same channel does NOT wake the set from standby —
-    WoL remains the only wake path.
+  - wss://<tv>:8002/api/{v2,v3}/channels/samsung.remote.control?name=<b64> is the
+    remote channel used for key presses (ms.remote.control). WHICH ONE WORKS IS A
+    FIRMWARE PROPERTY, not a constant: on 2026-10-25 v2 answered ms.channel.timeOut
+    and closed 1005 "notack" while v3 carried keys; on 2026-10-29 the same set
+    (TIZEN-TRUNK2025-NikeL-OSU-2024) accepts keys on v2 and answers
+    {"event":"ms.error","data":{"message":"unrecognized method value :
+    ms.remote.control"}} on v3 — the connect still succeeds, so the refusal is only
+    visible when the first key is sent. v2 is tried first (it is also the only
+    channel that returns a pairing token), v3 is the fallback.
+    The same channel does NOT wake the set from standby — that state closes 8002
+    entirely, which is why WoL remains the only wake path (and why WoL over WiFi
+    usually fails: this set is wireless).
   - The token-less ed.installedApp.get "list all apps" event is DEAD on this
     firmware (silently dropped), so the installed-app list is a *candidate
     probe* over CANDIDATE_APP_IDS; names/versions always come live from the TV.
@@ -45,6 +52,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
 TV_PORT = 8002
+TV_APIS = ("v2", "v3")
+_REMOTE_API = None   # channel proven to carry keys on this firmware
 REST_PORT = 8001
 CLIENT_NAME = "yast-bridge"
 HTTP_PORT = 8777
@@ -1063,26 +1072,34 @@ def control_power_on() -> dict:
             "method": "wol", "pending": True}
 
 
-def _remote_url(token=""):
+def _remote_url(token="", api="v2"):
     q = f"name={_b64(CLIENT_NAME)}"
     if token:
         q += f"&token={token}"
-    # v3, deliberately token-free: measured 2026-10-25, v2 answers ms.channel.timeOut
-    # and closes with the reserved code 1005 ("notack") when the pairing was never
-    # acknowledged, which every client library reports as a framing error. v3 accepts
-    # the same request with no token at all and delivers keys while the set is awake.
-    # The token is still passed when we have one, purely for older firmware.
-    return f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/v3/channels/samsung.remote.control?{q}"
+    # Which channel carries keys depends on the TV's firmware, not on us:
+    #   v2 — on TIZEN-TRUNK2025 (NikeL/OSU 2024) it answers ms.channel.connect and
+    #        silently accepts ms.remote.control, and it is the only channel that
+    #        returns a pairing token in its connect frame.
+    #   v3 — accepted the same request on 2026-10-25, but the same set now answers
+    #        {"event":"ms.error","data":{"message":"unrecognized method value :
+    #        ms.remote.control"}}; the connect succeeds and every key is refused.
+    # So neither can be hard-coded. v2 is tried first, v3 stays as the fallback for
+    # firmware where v2 still replies ms.channel.timeOut and closes with 1005.
+    return f"wss://{_cfg('tv_ip','')}:{TV_PORT}/api/{api}/channels/samsung.remote.control?{q}"
 
 
 def control_pair(timeout=45) -> str:
     """Pair (or re-pair) from scratch: drop any stored token first, then connect with
     none so the TV shows an Allow dialog. On approval the connect frame carries a
     token, which is persisted. Clearing first matters — a stale token is refused
-    outright (1005) and the TV never gets as far as asking."""
+    outright (1005) and the TV never gets as far as asking.
+
+    v2 only: v3's connect frame never carries a token, so pairing on v3 can only ever
+    fail with 'connected but no token'.
+    """
     global TV_TOKEN
     _clear_token()
-    ws = _open_remote_channel(timeout)
+    ws = _open_remote_channel(timeout, api="v2")
     try:
         tok = TV_TOKEN
         if not tok:
@@ -1106,7 +1123,7 @@ def _clear_token():
             pass
 
 
-def _open_remote_channel(wait_s: int):
+def _open_remote_channel(wait_s: int, api: str = "v2"):
     """Connect and wait for ms.channel.connect, adopting any token the TV hands back.
 
     wait_s must cover a human answering an on-screen Allowed dialog on the first
@@ -1114,7 +1131,7 @@ def _open_remote_channel(wait_s: int):
     """
     global TV_TOKEN
     ws = websocket.create_connection(
-        _remote_url(TV_TOKEN), timeout=wait_s, sslopt={"cert_reqs": ssl.CERT_NONE}
+        _remote_url(TV_TOKEN, api), timeout=wait_s, sslopt={"cert_reqs": ssl.CERT_NONE}
     )
     ws.settimeout(wait_s)
     # The remote channel broadcasts connect/disconnect events for ALL clients
@@ -1132,22 +1149,17 @@ def _open_remote_channel(wait_s: int):
     raise RuntimeError("no ms.channel.connect on remote channel")
 
 
-def _send_remote_key(key: str) -> bool:
-    """Send one remote key, self-healing a stale token.
-
-    If the stored token is refused, forget it and reconnect without one: the TV then
-    asks once, and the token it returns is saved. That converts 'rejected token →
-    prompt forever' into 'rejected token → one prompt → works'.
-    """
+def _send_key_on(api: str, key: str) -> bool:
+    """Deliver one key over one channel. False means the TV explicitly refused it."""
     global TV_TOKEN
     had_token = bool(TV_TOKEN)
     try:
-        ws = _open_remote_channel(8 if had_token else 45)
+        ws = _open_remote_channel(8 if had_token else 45, api=api)
     except Exception:
         if not had_token:
             raise
         _clear_token()
-        ws = _open_remote_channel(45)
+        ws = _open_remote_channel(45, api=api)
     try:
         ws.send(json.dumps({
             "method": "ms.remote.control",
@@ -1173,6 +1185,37 @@ def _send_remote_key(key: str) -> bool:
             ws.close()
         except Exception:
             pass
+
+
+def _send_remote_key(key: str) -> bool:
+    """Send one remote key, self-healing a stale token and the channel choice.
+
+    Channel: the firmware decides which of v2/v3 accepts ms.remote.control, and a
+    connect that succeeds proves nothing — the refusal arrives only when the first key
+    is sent. So a channel that answers ms.error is abandoned for the other one, and
+    the winner is remembered so ordinary keypresses cost a single handshake.
+
+    Token: if the stored token is refused, forget it and reconnect without one: the TV
+    then asks once, and the token it returns is saved. That converts 'rejected token →
+    prompt forever' into 'rejected token → one prompt → works'.
+    """
+    global _REMOTE_API
+    order = ([_REMOTE_API] if _REMOTE_API else []) + [
+        a for a in TV_APIS if a != _REMOTE_API
+    ]
+    for i, api in enumerate(order):
+        try:
+            ok = _send_key_on(api, key)
+        except Exception:
+            if i == 0:
+                # Unreachable/asleep set: the other channel would fail identically and
+                # would only double the caller's timeout.
+                raise
+            continue
+        if ok:
+            _REMOTE_API = api
+            return True
+    return False
 
 
 def control_power_off() -> dict:
