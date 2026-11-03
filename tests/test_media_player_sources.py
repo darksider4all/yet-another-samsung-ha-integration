@@ -112,6 +112,16 @@ class SourceResolution(unittest.IsolatedAsyncioTestCase):
         await e.async_select_source("MySpace")
         self.assertEqual(e.coordinator.calls, [])
 
+    def test_every_offered_source_has_artwork(self):
+        """APP_IMG is keyed by the ids the TV really reports, so cards don't fall back
+        to the cat. A curated name whose id has no artwork is a silent regression."""
+        e = self._entity()
+        apps = e._source_apps()
+        for name in e.source_list:
+            if name == "Live TV":
+                continue
+            self.assertIn(apps[name], self.mod.APP_IMG, f"{name} has no artwork")
+
 
 if __name__ == "__main__":
     unittest.main()
