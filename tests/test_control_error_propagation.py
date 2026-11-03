@@ -17,6 +17,7 @@ import json
 import os
 import pathlib
 import sys
+import threading
 import time
 import types
 import unittest
@@ -322,12 +323,91 @@ class LaunchGatedOnScreen(BridgeTest):
             self.mod.control_launch_app(self.TUNER)
         self.assertIn("screen never changed", str(ctx.exception))
 
-    def test_nothing_on_screen_before_leaves_the_gate_closed(self):
-        self.mod.poll_apps = lambda: ([], None, None)   # e.g. the tuner was already up
+    def test_a_wake_that_only_brings_up_our_agent_is_not_a_launch(self):
+        """The deployed failure: Netflix gave the screen up, the AGENT took it, no tuner.
+
+        ``visible`` says the screen changed, so the old gate answered ok while the
+        viewer was staring at the agent's own window. Our agent is the plumbing, never
+        the app we asked for.
+        """
+        self._was_showing(self.NETFLIX)
+        self.screen = {self.NETFLIX: False, self.mod.DEFAULT_AGENT_APP: True}
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mod.control_launch_app(self.TUNER)
+        self.assertIn("only our own agent came up", str(ctx.exception))
+
+    def test_a_wake_blocks_the_gate_even_when_nothing_was_on_screen(self):
+        """Same failure through the launcher/HDMI path: agent up, no baseline to compare."""
+        self.mod.poll_apps = lambda: ([], None, None)
+        self.screen = {self.mod.DEFAULT_AGENT_APP: True}
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mod.control_launch_app(self.TUNER)
+        self.assertIn("only our own agent came up", str(ctx.exception))
+
+    def test_the_agent_is_never_a_baseline_to_compare_against(self):
+        """An agent-held screen before the launch is 'nothing comparable', not a witness."""
+        self._was_showing(self.mod.DEFAULT_AGENT_APP, name="ChanProbe0")
+        self.screen = {self.mod.DEFAULT_AGENT_APP: False}
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mod.control_launch_app(self.TUNER)
+        self.assertIn("never reported it as the foreground app", str(ctx.exception))
+
+    def test_the_tuner_is_proven_by_the_agent_naming_it_foreground(self):
+        """No comparable app before the launch -> the agent's foreground report decides.
+
+        Posted over the real wire during the gate's window, because a report left over
+        from an earlier tuner session must not count. ``channel`` is deliberately
+        populated and WRONG in this report: measured on the set, it keeps reporting the
+        last-tuned channel while Netflix holds the screen, so it must not be accepted.
+        """
+        self.mod.poll_apps = lambda: ([], None, None)   # launcher / HDMI / empty
+        self.screen = {}
+        self.mod.LAUNCH_SCREEN_WAIT = 0.8
+
+        def report_later():
+            time.sleep(0.15)
+            self.post("/v1/report", {"source": "tv-agent", "event": "visibility",
+                                     "foregroundApp": self.TUNER,
+                                     "channel": {"name": "PRO TV HD", "number": "27"}})
+
+        threading.Thread(target=report_later, daemon=True).start()
+        self.assertTrue(self.mod.control_launch_app(self.TUNER))
+
+    def test_a_populated_channel_alone_never_proves_the_tuner(self):
+        """Measured trap: channel says PRO TV HD even while Netflix holds the screen."""
+        self.mod.poll_apps = lambda: ([], None, None)
+        self.screen = {}
+        self.mod.LAUNCH_SCREEN_WAIT = 0.5
+
+        def report_later():
+            time.sleep(0.15)
+            self.post("/v1/report", {"source": "tv-agent", "event": "heartbeat",
+                                     "foregroundApp": "org.tizen.netflix-app",
+                                     "channel": {"name": "PRO TV HD", "number": "27"}})
+
+        threading.Thread(target=report_later, daemon=True).start()
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mod.control_launch_app(self.TUNER)
+        self.assertIn("never reported it as the foreground app", str(ctx.exception))
+
+    def test_the_tuner_gate_closes_without_its_foreground_report(self):
+        self.mod.poll_apps = lambda: ([], None, None)
         self.screen = {}
         with self.assertRaises(RuntimeError) as ctx:
             self.mod.control_launch_app(self.TUNER)
-        self.assertIn("cannot verify", str(ctx.exception))
+        self.assertIn("never reported it as the foreground app", str(ctx.exception))
+
+    def test_a_stale_foreground_report_does_not_prove_this_launch(self):
+        """A foreground report from an earlier tuner session is not evidence for this one."""
+        self.mod.poll_apps = lambda: ([], None, None)
+        self.screen = {}
+        self.post("/v1/report", {"source": "tv-agent", "event": "heartbeat",
+                                 "foregroundApp": self.TUNER,
+                                 "channel": {"name": "PRO TV HD", "number": "27"}})
+        time.sleep(1.25)          # older than the gate's grace window
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mod.control_launch_app(self.TUNER)
+        self.assertIn("never reported it as the foreground app", str(ctx.exception))
 
     def test_the_already_foreground_app_needs_no_proof(self):
         self._was_showing(self.NETFLIX)

@@ -977,6 +977,42 @@ def _app_visible(app_id):
     return bool(st.get("visible"))
 
 
+def _agent_on_screen() -> bool:
+    """True while OUR agent holds the screen.
+
+    Launching anything goes through the agent, and the agent's window then takes the
+    foreground. That is the wake, not the app we asked for: it must never be read as
+    "the screen changed" — the deployed failure was exactly that (Netflix gave the
+    screen up, the agent took it, the tuner never appeared, and the gate said ok).
+    """
+    return _app_visible(_agent_app_id()) is True
+
+
+def _agent_saw_foreground(app_id, t0) -> bool:
+    """The unlisted app's own witness: an agent report naming it as the foreground app.
+
+    The tuner (org.tizen.tv-viewer) is a system app with no REST entry — every
+    /applications/<id> call 404s, and this firmware has no bulk /applications list — so
+    the TV names it nowhere except in the agent's telemetry, where
+    ``webapis.appcommon.getForegroundAppId()`` returns its id. Measured on the DU85
+    (2026-11-03, /v1/reportlog): the field is LIVE, not frozen — it read
+    ``org.tizen.tv-viewer`` while the tuner was up and ``org.tizen.netflix-app`` 2 s after
+    Netflix came back. ``channel`` is NOT usable: it kept reporting the last-tuned
+    "PRO TV HD" while Netflix held the screen.
+
+    Only a report received after ``t0`` counts, so an earlier session cannot prove this
+    launch. Ceiling: reports arrive on a 20 s heartbeat (plus event-driven ones), so a
+    slow flip can miss a short window — the gate then refuses, which is the safe way to
+    be wrong.
+    """
+    with _report_lock:
+        for ts, rep in list(_REPORT_RX):
+            if ts >= t0 and isinstance(rep, dict) and rep.get("source") == "tv-agent":
+                if rep.get("foregroundApp") == app_id:
+                    return True
+    return False
+
+
 def _launch_reached_screen(app_id: str, before_id, wait=None) -> tuple:
     """(True, None) once the TV's own screen report proves the launch landed.
 
@@ -985,28 +1021,46 @@ def _launch_reached_screen(app_id: str, before_id, wait=None) -> tuple:
     while the tuner never appeared. ``visible`` is the only measured witness, so:
       * an app the REST catalogue lists is proven by its own visible:true;
       * an app it cannot see (the tuner, 404) is proven by the screen NOT coming back —
-        the app that had it stays invisible for LAUNCH_SETTLE after the launch;
-      * when there is nothing to compare, the gate stays CLOSED and says why.
+        the app that had it stays invisible for LAUNCH_SETTLE after the launch — or, when
+        nothing comparable was on screen before, by the tuner's own channel telemetry;
+      * our own agent holding the screen proves nothing (that is the wake), and a gate
+        that never gets its witness stays CLOSED and says why.
     """
     wait = LAUNCH_SCREEN_WAIT if wait is None else wait
+    # Only telemetry received around this launch can prove it: a channel report left
+    # over from an earlier tuner session is minutes old, so a one-second grace before
+    # this point is enough to catch a report that raced in right after the POST.
+    t0 = time.time() - 1.0
     if before_id and app_id == before_id:
         return True, None      # already the foreground app: nothing to prove
+    # Waking our own agent is not "what was on screen", so it is no baseline either.
+    if before_id == _agent_app_id():
+        before_id = None
     deadline = time.time() + wait
     while True:
         st = _rest_app_status(app_id)
         if st and st.get("visible"):
             return True, None
         if st == {}:                     # not in the REST catalogue
-            if not before_id:
-                return False, (f"cannot verify: {app_id} has no REST entry and no app was "
-                               "on screen before the launch, so the TV has nothing to compare")
-            if _app_visible(before_id) is False:
-                time.sleep(LAUNCH_SETTLE)
+            if _agent_on_screen():
+                pass                     # the wake took the screen, not the target
+            elif before_id:
                 if _app_visible(before_id) is False:
-                    return True, None
+                    time.sleep(LAUNCH_SETTLE)
+                    if _app_visible(before_id) is False and not _agent_on_screen():
+                        return True, None
+            elif _agent_saw_foreground(app_id, t0):
+                return True, None
         if time.time() >= deadline:
             if st is None:
                 return False, "the TV's REST API stopped answering, so the screen could not be read"
+            if _agent_on_screen():
+                return False, (f"only our own agent came up: {app_id} never took the "
+                               f"screen after {wait:.0f}s")
+            if not before_id and st == {}:
+                return False, (f"nothing proves {app_id} reached the screen: no app was on "
+                               f"screen before, its REST entry 404s, and the agent never "
+                               f"reported it as the foreground app within {wait:.0f}s")
             now = _visible_app_now()
             who = (now or {}).get("name") or "the previous screen"
             return False, (f"Tizen accepted the launch, the screen never changed "
