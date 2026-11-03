@@ -945,8 +945,23 @@ def poller_loop(state: TVState, stop_event: threading.Event):
 
 # ---- control actions -------------------------------------------------------
 
+LIVE_TV_APP = "org.tizen.tv-viewer"  # the tuner: a system app, absent from the REST app
+# catalogue (POST applications/org.tizen.tv-viewer -> 404) and from the agent's list.
+# Tizen can still launch it by id, so the on-TV agent does it (see control_launch_app).
+
+
 def control_launch_app(app_id: str) -> bool:
-    _rest_request(f"applications/{app_id}", "POST")
+    try:
+        _rest_request(f"applications/{app_id}", "POST")
+        return True
+    except Exception as e:  # noqa: BLE001
+        if getattr(e, "code", None) != 404:
+            raise
+    # 404 = not an installed app: only the TV's own Tizen runtime can start it, so
+    # hand the launch to the on-TV agent (which calls tizen.application.launch).
+    ok, err = run_agent_command({"action": "launch_app", "app_id": app_id})
+    if not ok:
+        raise RuntimeError(f"launch {app_id} failed: {err}")
     return True
 
 
@@ -1589,7 +1604,11 @@ CONTROL_ACTIONS = {
         "token_file": TOKEN_FILE,
         "client_name": CLIENT_NAME,
     },
-    "send_key": lambda b: _send_remote_key(b["key"]),
+    # The TV never confirms a keypress, and on this firmware (Tizen 9 / TIZEN-TRUNK2025)
+    # the ws channels either swallow keys (v2) or refuse them outright (v3), so a False
+    # result is a refusal and a True result only proves the frame left the bridge.
+    # Say that in the reply instead of implying the TV acted.
+    "send_key": lambda b: {"sent": bool(_send_remote_key(b["key"])), "verified": False},
 }
 
 
@@ -1807,6 +1826,57 @@ def take_commands():
     if dropped:
         print(f"dropped {dropped} stale command(s) older than {COMMAND_TTL:.0f}s", flush=True)
     return out
+
+
+AGENT_PICKUP_WAIT = 3.0  # seconds to wait for the TV app to long-poll a queued command
+
+
+def _agent_took(cmd) -> bool:
+    """True once the agent's GET /v1/commands has removed this exact command."""
+    with _cmd_cond:
+        return all(c is not cmd for _, c in _cmd_queue)
+
+
+def _drop_command(cmd) -> None:
+    with _cmd_cond:
+        for i, (_, c) in enumerate(_cmd_queue):
+            if c is cmd:
+                del _cmd_queue[i]
+                return
+
+
+def _wait_pickup(cmd, wait) -> bool:
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if _agent_took(cmd):
+            return True
+        time.sleep(0.1)
+    return _agent_took(cmd)
+
+
+def run_agent_command(cmd, wait=None) -> tuple:
+    """Queue an agent action and prove the TV app actually picked it up.
+
+    Tizen suspends a hidden web app's timers, so an agent that is not on screen stops
+    polling and the command just sits in the queue until it expires — the card said
+    {"ok": true} while volume/mute did nothing whenever an app was playing. Wake the
+    agent (silently: this is a volume step, not a dashboard request) and wait again;
+    drop the command and report the failure rather than leave a stale one to fire later.
+    """
+    wait = AGENT_PICKUP_WAIT if wait is None else wait
+    enqueue_command(cmd)
+    if _wait_pickup(cmd, wait):
+        return True, None
+    global _LAUNCH_MODE
+    _LAUNCH_MODE = "background"
+    ok, err = launch_agent()
+    if not ok:
+        _drop_command(cmd)
+        return False, f"agent not polling and could not be woken: {err}"
+    if _wait_pickup(cmd, wait):
+        return True, None
+    _drop_command(cmd)
+    return False, "agent did not pick up the command"
 
 
 # Pending toast: set by POST /v1/notify, consumed once by the agent on (re)launch
@@ -2191,16 +2261,21 @@ def make_handler(state: TVState):
                     if problem:
                         self._send(400, json.dumps({"error": "bad_payload", "message": problem}).encode("utf-8"), "application/json")
                         return
-                    # Reliable path: hand to the on-TV agent (executes via Tizen APIs)
-                    enqueue_command(body)
+                    # Reliable path: hand to the on-TV agent (executes via Tizen APIs).
+                    # run_agent_command wakes a suspended agent and proves the pickup,
+                    # so the reply stops claiming success for a command nobody took.
+                    ok, err = run_agent_command(body)
                     # Force HA to re-read the bridge right after a state-changing
                     # command, so the card does not sit on the old app/channel until the
                     # next scheduled scan (scan_interval is the dominant lag).
                     if action in STATE_CHANGING_ACTIONS:
                         for _d in (0.0, 2.5):
                             threading.Thread(target=_poke_ha_state, args=(_d,), daemon=True).start()
-                    online = _AGENT.snapshot().get("online")
-                    self._send(200, json.dumps({"ok": True, "queued": True, "agent_online": bool(online)}).encode("utf-8"), "application/json")
+                    payload = {"ok": ok, "queued": True,
+                               "agent_online": bool(_AGENT.snapshot().get("online"))}
+                    if not ok:
+                        payload["error"] = err
+                    self._send(200, json.dumps(payload).encode("utf-8"), "application/json")
                 elif action in CONTROL_ACTIONS:
                     res = CONTROL_ACTIONS[action](body)
                     if action in STATE_CHANGING_ACTIONS:

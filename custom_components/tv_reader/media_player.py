@@ -343,7 +343,11 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
 
     async def async_select_source(self, source: str) -> None:
         if source == "Live TV":
-            await self.coordinator.control("launch_app", app_id=LIVE_TV_APP)
+            # The tuner is a system app: REST 404s and the bridge has the on-TV agent
+            # launch it (tizen.application.launch), so it works with any app playing.
+            res = await self.coordinator.control("launch_app", app_id=LIVE_TV_APP)
+            if not (isinstance(res, dict) and res.get("ok")):
+                _LOGGER.warning("tv_reader: Live TV did not launch: %s", res)
             return
         # Resolve the name against the TV's own catalogue instead of a hardcoded id
         # table: an id the set doesn't expose makes the bridge answer 500 (404 upstream).
