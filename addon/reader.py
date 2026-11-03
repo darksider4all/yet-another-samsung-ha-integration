@@ -945,9 +945,12 @@ def poller_loop(state: TVState, stop_event: threading.Event):
 
 # ---- control actions -------------------------------------------------------
 
-LIVE_TV_APP = "org.tizen.tv-viewer"  # the tuner: a system app, absent from the REST app
+LIVE_TV_APP = "org.tizen.tv-viewer"  # the tuner: a system app, absent from the REST
 # catalogue (POST applications/org.tizen.tv-viewer -> 404) and from the agent's list.
 # Tizen can still launch it by id, so the on-TV agent does it (see control_launch_app).
+
+# Per-thread re-entry flag for control_launch_app (see the guard there).
+_AGENT_LAUNCH = threading.local()
 
 
 def control_launch_app(app_id: str) -> bool:
@@ -959,7 +962,15 @@ def control_launch_app(app_id: str) -> bool:
             raise
     # 404 = not an installed app: only the TV's own Tizen runtime can start it, so
     # hand the launch to the on-TV agent (which calls tizen.application.launch).
-    ok, err = run_agent_command({"action": "launch_app", "app_id": app_id})
+    # Re-entry guard: run_agent_command may itself call launch_agent -> control_launch_app,
+    # and each level costs AGENT_PICKUP_WAIT, so a missing agent app would recurse.
+    if getattr(_AGENT_LAUNCH, "busy", False):
+        raise RuntimeError(f"launch {app_id} skipped: already waking the agent")
+    _AGENT_LAUNCH.busy = True
+    try:
+        ok, err = run_agent_command({"action": "launch_app", "app_id": app_id})
+    finally:
+        _AGENT_LAUNCH.busy = False
     if not ok:
         raise RuntimeError(f"launch {app_id} failed: {err}")
     return True
@@ -1616,11 +1627,16 @@ CONTROL_ACTIONS = {
 
 
 # Latest telemetry report POSTed by the ON-TV Tizen app (tizen.tvchannel etc.)
+from collections import deque  # noqa: E402
 _LATEST_REPORT = {}
 _report_lock = threading.Lock()
-# Ring buffer of the last N reports (for diagnostics / stream inspection)
-from collections import deque  # noqa: E402
-_REPORT_LOG = deque(maxlen=80)
+# Ring buffer of the last N reports (for diagnostics / stream inspection).
+# 200, not 80: a tv-agent-cmderr is the only witness to a refused agent action
+# (e.g. an undeclared privilege) and it was gone from this ring within minutes.
+_REPORT_LOG = deque(maxlen=200)
+# (received_at monotonic-ish wall stamp, report) — used to match an agent's execution
+# report to the command that asked for it.
+_REPORT_RX = deque(maxlen=200)
 
 
 class AgentState:
@@ -1796,9 +1812,11 @@ def validate_agent_action(body: dict) -> str | None:
     if kind == "string" and not isinstance(val, str):
         return f"{body.get('action')} needs '{key}' as a string, got {type(val).__name__}"
     return None
-# launch_app is deliberately NOT an agent action: a hidden Tizen app has its
-# timers suspended, so handing a "launch yourself" command to it can never work.
-# It must run bridge-side through CONTROL_ACTIONS, which talks to the TV's REST API.
+
+
+# launch_app CAN be an agent action, in one case only: the tuner (LIVE_TV_APP) is a
+# system app with no REST id, so the on-TV agent's tizen.application.launch is the
+# only launcher. Every other app goes through CONTROL_ACTIONS -> the TV's REST API.
 
 
 def enqueue_command(cmd):
@@ -1862,8 +1880,24 @@ def run_agent_command(cmd, wait=None) -> tuple:
     {"ok": true} while volume/mute did nothing whenever an app was playing. Wake the
     agent (silently: this is a volume step, not a dashboard request) and wait again;
     drop the command and report the failure rather than leave a stale one to fire later.
+
+    Pickup is not execution, though: the agent reports separately (cmd:<action> on
+    /v1/report, tv-agent-cmderr on failure). For launch_app — the one action where a
+    silent Tizen SecurityError was mistaken for success — the reply is gated on that
+    report, so ok means the TV really launched it.
     """
     wait = AGENT_PICKUP_WAIT if wait is None else wait
+    started = time.time()
+    ok, err = _deliver_command(cmd, wait)
+    if not ok:
+        return False, err
+    if str(cmd.get("action")) == "launch_app":
+        return _wait_agent_result("launch_app", started)
+    return True, None
+
+
+def _deliver_command(cmd, wait) -> tuple:
+    """Get the command out of the queue and into the agent's hands."""
     enqueue_command(cmd)
     if _wait_pickup(cmd, wait):
         return True, None
@@ -1877,6 +1911,31 @@ def run_agent_command(cmd, wait=None) -> tuple:
         return True, None
     _drop_command(cmd)
     return False, "agent did not pick up the command"
+
+
+AGENT_RESULT_WAIT = 3.0  # seconds to wait for the TV app to report it RAN a command
+
+
+def _wait_agent_result(action, since, wait=AGENT_RESULT_WAIT) -> tuple:
+    """(True, None) once the agent reports it ran <action>; (False, reason) if it failed.
+
+    A timeout is a failure, not a shrug: assuming the action happened is exactly what
+    hid the tuner never launching.
+    """
+    deadline = time.time() + wait
+    while True:
+        with _report_lock:
+            for ts, r in _REPORT_RX:
+                if ts < since:
+                    continue
+                src = r.get("source")
+                if src == "tv-agent" and r.get("event") == f"cmd:{action}":
+                    return True, None
+                if src == "tv-agent-cmderr" and r.get("action") == action:
+                    return False, f"agent failed {action}: {r.get('err') or 'unknown error'}"
+        if time.time() >= deadline:
+            return False, f"agent took {action} but never reported the result"
+        time.sleep(0.15)
 
 
 # Pending toast: set by POST /v1/notify, consumed once by the agent on (re)launch
@@ -2241,6 +2300,7 @@ def make_handler(state: TVState):
                         _LATEST_REPORT["received_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
                         stored = dict(_LATEST_REPORT)
                         _REPORT_LOG.append(stored)
+                        _REPORT_RX.append((time.time(), dict(data) if isinstance(data, dict) else {}))
                     if isinstance(data, dict) and data.get("source") == "tv-agent":
                         _AGENT.update_from_report(data)
                     self._send(200, json.dumps({"ok": True, "received_at": stored["received_at"]}).encode("utf-8"), "application/json")
