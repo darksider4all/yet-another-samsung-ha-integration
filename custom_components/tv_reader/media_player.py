@@ -26,6 +26,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from . import TvReaderCoordinator
+from .apps import APP_IMG, LIVE_TV, source_entries
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -63,34 +64,10 @@ FRIENDLY = {
     "org.tizen.browser": "Internet",
 }
 
-# Curated source menu for the card dropdown (Live TV + a few apps), instead of the
-# full ~200-app catalog. (name, tizen_app_id) - edit this list to taste.
-# Source menu = "Live TV" (launches the tuner app) + the TV's HDMI inputs (switched
-# via tizen.tvwindow.setSource, which does drive the real display here) + a curated
-# app shortlist. HDMI inputs + names come dynamically from the agent (VIDEOSOURCE).
+# The source menu is NOT a hardcoded table: it comes from the app catalogue the
+# bridge reports (GET /v1/state -> installed_apps), because launchable ids differ
+# per model/firmware and a stale table 404s. See apps.py.
 LIVE_TV_APP = "org.tizen.tv-viewer"
-SOURCE_APPS = [
-    ("Netflix",     "org.tizen.netflix-app"),
-    ("YouTube",     "com.samsung.tv.cobalt-yt"),
-    ("Prime Video", "org.tizen.primevideo"),
-    ("Disney+",     "MCmYXNxgcu.DisneyPlus"),
-    ("Plex",        "kIciSQlYEM.plex"),
-    ("Spotify",     "rJeHak5zRg.Spotify"),
-]
-
-# Artwork is served by the bridge at <host>/img/<file> (cat fallback for anything missing).
-# foreground app id -> artwork file (original themed tiles, not brand logos)
-APP_IMG = {
-    "com.samsung.tv.cobalt-yt": "app_youtube.png", "111299001912": "app_youtube.png",
-    "9Ur5IzDKqV.TizenYouTube": "app_youtube.png",
-    "org.tizen.netflix-app": "app_netflix.png", "3201907018807": "app_netflix.png",
-    "org.tizen.primevideo": "app_prime.png", "3201910019365": "app_prime.png",
-    "MCmYXNxgcu.DisneyPlus": "app_disney.png", "3201901017640": "app_disney.png",
-    "kIciSQlYEM.plex": "app_plex.png", "3201512006963": "app_plex.png",
-    "rJeHak5zRg.Spotify": "app_spotify.png", "3201606009684": "app_spotify.png",
-    "org.tizen.browser": "app_internet.png",
-    "com.samsung.tv.csfs": "home.png",
-}
 
 SUPPORT = (
     MediaPlayerEntityFeature.VOLUME_SET
@@ -240,7 +217,8 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
 
     @property
     def source_list(self):
-        return ["Live TV"] + [name for name, _ in SOURCE_APPS]
+        # Derived from the bridge's launchable catalogue, never a hardcoded id table.
+        return [LIVE_TV] + [name for name, _ in source_entries(self._d.get("installed_apps"))]
 
     @property
     def app_id(self):
@@ -313,10 +291,13 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         await self.coordinator.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
-        if source == "Live TV":
+        if source == LIVE_TV:
             await self.coordinator.control("launch_app", app_id=LIVE_TV_APP)
             return
-        appid = next((aid for name, aid in SOURCE_APPS if name == source), None)
+        appid = next(
+            (aid for name, aid in source_entries(self._d.get("installed_apps")) if name == source),
+            None,
+        )
         if appid:
             await self.coordinator.control("launch_app", app_id=appid)
         else:
