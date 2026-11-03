@@ -97,6 +97,11 @@ class LiveTvRoutingTest(BridgeTest):
     def setUp(self):
         super().setUp()
         self.mod.AGENT_PICKUP_WAIT = 0.05
+        # These tests are about ROUTING (which launcher gets the call). The screen gate
+        # has its own suite in test_control_error_propagation, so stub it here.
+        self.mod.poll_apps = lambda: ([], {"appId": "3201907018807", "name": "Netflix",
+                                           "visible": True}, None)
+        self.mod._launch_reached_screen = lambda app_id, before_id, wait=None: (True, None)
 
     def test_live_tv_constant_is_the_tuner_app(self):
         self.assertEqual(self.mod.LIVE_TV_APP, "org.tizen.tv-viewer")

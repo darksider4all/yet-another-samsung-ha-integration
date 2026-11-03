@@ -32,6 +32,10 @@ PLATFORMS = ["media_player", "sensor"]
 _LOGGER = logging.getLogger(__package__)
 
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
+# Controls now wait for the TV's screen to prove the action landed (a launch is gated on
+# the foreground app actually changing), so the budget covers agent pickup + execution
+# report + that screen gate. Reads keep the short timeout.
+_CONTROL_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -105,7 +109,7 @@ class TvReaderCoordinator(DataUpdateCoordinator):
         """
         payload = {"action": action, **kwargs}
         async with self._session.post(
-            f"{self._host}/v1/control", json=payload, timeout=_REQUEST_TIMEOUT
+            f"{self._host}/v1/control", json=payload, timeout=_CONTROL_TIMEOUT
         ) as resp:
             body = await resp.json(content_type=None)
             refused = resp.status >= 400

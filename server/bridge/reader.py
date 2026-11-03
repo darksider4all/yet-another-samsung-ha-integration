@@ -952,27 +952,103 @@ LIVE_TV_APP = "org.tizen.tv-viewer"  # the tuner: a system app, absent from the 
 # Per-thread re-entry flag for control_launch_app (see the guard there).
 _AGENT_LAUNCH = threading.local()
 
+LAUNCH_SCREEN_WAIT = 6.0  # budget for the TV to actually put an app on screen
+LAUNCH_SETTLE = 2.0       # the change must STAY: a closing splash flashes through it
+
+
+def _agent_app_id() -> str:
+    return _cfg("agent_app_id", "") or DEFAULT_AGENT_APP
+
+
+def _app_visible(app_id):
+    """The TV's own ``visible`` flag for one app: True/False, or None if it will not say.
+
+    Measured on the DU85 (2026-11-03): exactly one app reports visible:true at a time —
+    YouTube and the on-TV agent both kept running:true while Netflix held the screen —
+    so this is the field that separates foreground from background. A 404 means the app
+    is not REST-listed at all (the tuner), which reads as "cannot be holding the
+    screen", not "unknown".
+    """
+    st = _rest_app_status(app_id)
+    if st is None:
+        return None            # the TV did not answer
+    if st == {}:
+        return False           # not installed / not listed
+    return bool(st.get("visible"))
+
+
+def _launch_reached_screen(app_id: str, before_id, wait=None) -> tuple:
+    """(True, None) once the TV's own screen report proves the launch landed.
+
+    Neither launcher tells the truth on its own: both answer success without checking
+    they were allowed to run, and the deployed agent posted ``cmd:launch_app`` twice
+    while the tuner never appeared. ``visible`` is the only measured witness, so:
+      * an app the REST catalogue lists is proven by its own visible:true;
+      * an app it cannot see (the tuner, 404) is proven by the screen NOT coming back —
+        the app that had it stays invisible for LAUNCH_SETTLE after the launch;
+      * when there is nothing to compare, the gate stays CLOSED and says why.
+    """
+    wait = LAUNCH_SCREEN_WAIT if wait is None else wait
+    if before_id and app_id == before_id:
+        return True, None      # already the foreground app: nothing to prove
+    deadline = time.time() + wait
+    while True:
+        st = _rest_app_status(app_id)
+        if st and st.get("visible"):
+            return True, None
+        if st == {}:                     # not in the REST catalogue
+            if not before_id:
+                return False, (f"cannot verify: {app_id} has no REST entry and no app was "
+                               "on screen before the launch, so the TV has nothing to compare")
+            if _app_visible(before_id) is False:
+                time.sleep(LAUNCH_SETTLE)
+                if _app_visible(before_id) is False:
+                    return True, None
+        if time.time() >= deadline:
+            if st is None:
+                return False, "the TV's REST API stopped answering, so the screen could not be read"
+            now = _visible_app_now()
+            who = (now or {}).get("name") or "the previous screen"
+            return False, (f"Tizen accepted the launch, the screen never changed "
+                           f"({who} still foreground after {wait:.0f}s)")
+        time.sleep(0.4)
+
 
 def control_launch_app(app_id: str) -> bool:
+    # Snapshot the screen BEFORE touching it: the app that has it now is the one that
+    # must give way, and that snapshot is the only evidence the TV offers afterwards.
+    # Waking our own agent is internal plumbing whose effect the agent's own reports
+    # already prove (it has to long-poll to receive the command), so it skips the gate.
+    internal = app_id == _agent_app_id()
+    before_id = None
+    if not internal:
+        _, before, err = poll_apps()
+        if err == "rest unreachable":
+            raise RuntimeError(f"launch {app_id} failed: TV REST unreachable, cannot verify the screen")
+        before_id = (before or {}).get("appId")
     try:
         _rest_request(f"applications/{app_id}", "POST")
-        return True
     except Exception as e:  # noqa: BLE001
         if getattr(e, "code", None) != 404:
             raise
-    # 404 = not an installed app: only the TV's own Tizen runtime can start it, so
-    # hand the launch to the on-TV agent (which calls tizen.application.launch).
-    # Re-entry guard: run_agent_command may itself call launch_agent -> control_launch_app,
-    # and each level costs AGENT_PICKUP_WAIT, so a missing agent app would recurse.
-    if getattr(_AGENT_LAUNCH, "busy", False):
-        raise RuntimeError(f"launch {app_id} skipped: already waking the agent")
-    _AGENT_LAUNCH.busy = True
-    try:
-        ok, err = run_agent_command({"action": "launch_app", "app_id": app_id})
-    finally:
-        _AGENT_LAUNCH.busy = False
+        # 404 = not an installed app: only the TV's own Tizen runtime can start it, so
+        # hand the launch to the on-TV agent (which calls tizen.application.launch).
+        # Re-entry guard: run_agent_command may itself call launch_agent -> control_launch_app,
+        # and each level costs AGENT_PICKUP_WAIT, so a missing agent app would recurse.
+        if getattr(_AGENT_LAUNCH, "busy", False):
+            raise RuntimeError(f"launch {app_id} skipped: already waking the agent")
+        _AGENT_LAUNCH.busy = True
+        try:
+            ok, err = run_agent_command({"action": "launch_app", "app_id": app_id})
+        finally:
+            _AGENT_LAUNCH.busy = False
+        if not ok:
+            raise RuntimeError(f"launch {app_id} failed: {err}")
+    if internal:
+        return True
+    ok, why = _launch_reached_screen(app_id, before_id)
     if not ok:
-        raise RuntimeError(f"launch {app_id} failed: {err}")
+        raise RuntimeError(f"launch {app_id} failed: {why}")
     return True
 
 
@@ -1892,7 +1968,7 @@ def run_agent_command(cmd, wait=None) -> tuple:
     if not ok:
         return False, err
     if str(cmd.get("action")) == "launch_app":
-        return _wait_agent_result("launch_app", started)
+        return _wait_agent_result("launch_app", started, app_id=cmd.get("app_id"))
     return True, None
 
 
@@ -1916,17 +1992,22 @@ def _deliver_command(cmd, wait) -> tuple:
 AGENT_RESULT_WAIT = 3.0  # seconds to wait for the TV app to report it RAN a command
 
 
-def _wait_agent_result(action, since, wait=AGENT_RESULT_WAIT) -> tuple:
+def _wait_agent_result(action, since, app_id=None, wait=None) -> tuple:
     """(True, None) once the agent reports it ran <action>; (False, reason) if it failed.
 
     A timeout is a failure, not a shrug: assuming the action happened is exactly what
-    hid the tuner never launching.
+    hid the tuner never launching. A report that names the app it ran must name the one
+    we asked for, so two launches in flight cannot cross-confirm each other.
     """
+    wait = AGENT_RESULT_WAIT if wait is None else wait
     deadline = time.time() + wait
     while True:
         with _report_lock:
             for ts, r in _REPORT_RX:
                 if ts < since:
+                    continue
+                said = r.get("app_id") or r.get("appId")
+                if said and app_id and said != app_id:
                     continue
                 src = r.get("source")
                 if src == "tv-agent" and r.get("event") == f"cmd:{action}":
@@ -2337,7 +2418,15 @@ def make_handler(state: TVState):
                         payload["error"] = err
                     self._send(200, json.dumps(payload).encode("utf-8"), "application/json")
                 elif action in CONTROL_ACTIONS:
-                    res = CONTROL_ACTIONS[action](body)
+                    try:
+                        res = CONTROL_ACTIONS[action](body)
+                    except RuntimeError as e:
+                        # The control ran and was refused (or the screen never moved):
+                        # the same class as power_unknown below, so answer 409 instead
+                        # of letting the generic handler turn it into a bare 500.
+                        self._send(409, json.dumps({"ok": False, "reason": "refused",
+                                                    "error": str(e)}).encode("utf-8"), "application/json")
+                        return
                     if action in STATE_CHANGING_ACTIONS:
                         for _d in (0.0, 2.5):
                             threading.Thread(target=_poke_ha_state, args=(_d,), daemon=True).start()
