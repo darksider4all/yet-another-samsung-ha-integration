@@ -284,8 +284,13 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         await self.coordinator.control("volume_down")
 
     async def async_mute_volume(self, mute: bool) -> None:
-        if bool(self.is_volume_muted) != bool(mute):
-            await self.coordinator.control("mute")
+        # The bridge requires {"action":"mute","value":<bool>} (AGENT_ACTION_ARGS in
+        # addon/reader.py) and refuses a bare "mute" with 400 bad_payload — which is
+        # what made this button a no-op. Send unconditionally: is_volume_muted is the
+        # agent's cached audio state, absent/stale whenever the agent is not reporting
+        # (it reads false while the TV sits at normal volume), so guarding on it
+        # swallowed every unmute request.
+        await self.coordinator.control("mute", value=bool(mute))
 
     async def async_turn_off(self) -> None:
         # Local, cloud-free: KEY_POWER over the TV's own remote-control WS (via the
