@@ -69,14 +69,18 @@ FRIENDLY = {
 # via tizen.tvwindow.setSource, which does drive the real display here) + a curated
 # app shortlist. HDMI inputs + names come dynamically from the agent (VIDEOSOURCE).
 LIVE_TV_APP = "org.tizen.tv-viewer"
-SOURCE_APPS = [
-    ("Netflix",     "org.tizen.netflix-app"),
-    ("YouTube",     "com.samsung.tv.cobalt-yt"),
-    ("Prime Video", "org.tizen.primevideo"),
-    ("Disney+",     "MCmYXNxgcu.DisneyPlus"),
-    ("Plex",        "kIciSQlYEM.plex"),
-    ("Spotify",     "rJeHak5zRg.Spotify"),
-]
+# Curated shortlist for the card dropdown, kept as friendly NAMES only. The app id
+# behind each name is resolved from the catalogue the TV itself reports (see
+# _source_apps) because a hardcoded id table rots: three of the six ids we used to
+# ship -- org.tizen.netflix-app, com.samsung.tv.cobalt-yt and org.tizen.primevideo --
+# answer 404 on POST /api/v2/applications/<id> on UE55DU8572UXXH, so those three
+# sources could never launch (bridge answered HTTP 500 "HTTP Error 404: Not Found").
+SOURCE_NAMES = ("Netflix", "YouTube", "Prime Video", "Disney+", "Plex", "Spotify")
+
+# Names the TV reports that a human reads differently.
+SOURCE_LABELS = {
+    "spotify - music and podcasts": "Spotify",
+}
 
 # Artwork is served by the bridge at <host>/img/<file> (cat fallback for anything missing).
 # foreground app id -> artwork file (original themed tiles, not brand logos)
@@ -238,9 +242,34 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
             return ra.get("name")
         return (self._agent.get("input") or {}).get("type")
 
+    @staticmethod
+    def _label(name):
+        """Friendly source name for a catalogue entry (see SOURCE_LABELS)."""
+        return SOURCE_LABELS.get((name or "").strip().lower(), (name or "").strip())
+
+    def _source_apps(self) -> dict:
+        """{friendly name: app id} for the sources we offer.
+
+        The bridge publishes installed_apps[] in /v1/state, resolved against the TV's
+        own REST catalogue, so those appIds are the ones the set will actually launch.
+        The agent's longer app list is only a fallback for shortlisted names the bridge
+        list doesn't cover -- its ids are catalogue ids, which are not always launchable.
+        """
+        apps = {}
+        for a in (self._d.get("installed_apps") or []):
+            aid, name = a.get("appId"), self._label(a.get("name"))
+            if aid and name:
+                apps.setdefault(name, aid)
+        for a in (self._agent.get("apps") or []):
+            aid, name = a.get("id"), self._label(a.get("name"))
+            if aid and name and name in SOURCE_NAMES and name not in apps:
+                apps.setdefault(name, aid)
+        return apps
+
     @property
     def source_list(self):
-        return ["Live TV"] + [name for name, _ in SOURCE_APPS]
+        apps = self._source_apps()
+        return ["Live TV"] + [n for n in SOURCE_NAMES if n in apps]
 
     @property
     def app_id(self):
@@ -316,7 +345,9 @@ class TvReaderMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         if source == "Live TV":
             await self.coordinator.control("launch_app", app_id=LIVE_TV_APP)
             return
-        appid = next((aid for name, aid in SOURCE_APPS if name == source), None)
+        # Resolve the name against the TV's own catalogue instead of a hardcoded id
+        # table: an id the set doesn't expose makes the bridge answer 500 (404 upstream).
+        appid = self._source_apps().get(self._label(source))
         if appid:
             await self.coordinator.control("launch_app", app_id=appid)
         else:
