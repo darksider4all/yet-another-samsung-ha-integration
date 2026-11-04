@@ -32,6 +32,10 @@ PLATFORMS = ["media_player", "sensor"]
 _LOGGER = logging.getLogger(__package__)
 
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
+# Controls now wait for the TV's screen to prove the action landed (a launch is gated on
+# the foreground app actually changing), so the budget covers agent pickup + execution
+# report + that screen gate. Reads keep the short timeout.
+_CONTROL_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -97,19 +101,27 @@ class TvReaderCoordinator(DataUpdateCoordinator):
     async def control(self, action: str, **kwargs) -> dict:
         """Forward a control action to POST /v1/control.
 
-        The bridge answers non-200 when a control did not happen (no remote token,
-        unknown power state). Raise instead of returning that body: a swallowed
-        failure is what made turn_off look successful while the TV stayed on.
+        Two ways a control does not happen and both must raise: a non-200 (no remote
+        token, unknown power state) and a 200 carrying ``ok: false`` — the bridge now
+        answers 200 for an agent action that was queued but failed or was never
+        confirmed, and a swallowed failure is what made turn_off look successful while
+        the TV stayed on, then volume/mute, then Live TV.
         """
         payload = {"action": action, **kwargs}
         async with self._session.post(
-            f"{self._host}/v1/control", json=payload, timeout=_REQUEST_TIMEOUT
+            f"{self._host}/v1/control", json=payload, timeout=_CONTROL_TIMEOUT
         ) as resp:
             body = await resp.json(content_type=None)
-            if resp.status >= 400:
+            refused = resp.status >= 400
+            if isinstance(body, dict) and body.get("ok") is False:
+                # Exceptions, and they are the bridge's own words: a set that is
+                # already in the asked-for state sends no key, so it answers ok:false
+                # with reason already_on — that is a satisfied request, not a failure.
+                refused = body.get("reason") not in ("already_on", "already_off")
+            if refused:
                 reason = ""
                 if isinstance(body, dict):
-                    reason = body.get("reason") or body.get("error") or ""
+                    reason = body.get("error") or body.get("reason") or ""
                 raise HomeAssistantError(
                     f"bridge refused {action} (HTTP {resp.status}){': ' + str(reason) if reason else ''}"
                 )
