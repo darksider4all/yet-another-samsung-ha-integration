@@ -303,6 +303,44 @@ class PowerOnHttpTest(BridgeTest):
         self.assertEqual(self.mod._POWER_CACHE, "standby", "a refused key changed no state")
 
 
+class SendKeyPowerGuardTest(BridgeTest):
+    """POST /v1/control action=send_key is a blind key passthrough with no power-state
+    read in front of it. KEY_POWER is a toggle: on a standby set it switches the TV ON.
+    Power may only transit power_on/power_off, which read the state first."""
+
+    def _spy(self):
+        sent = []
+        self.mod._send_remote_key = lambda key: (sent.append(key), True)[1]
+        return sent
+
+    def test_key_power_is_refused_and_never_reaches_the_tv(self):
+        from urllib.error import HTTPError
+        sent = self._spy()
+        with self.assertRaises(HTTPError) as ctx:
+            self.post("/v1/control", {"action": "send_key", "key": "KEY_POWER"})
+        self.assertEqual(ctx.exception.code, 409)
+        body = json.loads(ctx.exception.read().decode() or "{}")
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["reason"], "power_is_guarded")
+        self.assertEqual(sent, [], "a blind KEY_POWER must never leave the bridge")
+
+    def test_the_guard_is_case_insensitive(self):
+        from urllib.error import HTTPError
+        sent = self._spy()
+        for key in ("key_power", "KEY_POWEROFF"):
+            with self.assertRaises(HTTPError):
+                self.post("/v1/control", {"action": "send_key", "key": key})
+        self.assertEqual(sent, [])
+
+    def test_any_other_key_still_sends(self):
+        sent = self._spy()
+        status, body = self.post("/v1/control", {"action": "send_key", "key": "KEY_VOLUMEUP"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["sent"])
+        self.assertIsNone(body.get("reason"))
+        self.assertEqual(sent, ["KEY_VOLUMEUP"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
