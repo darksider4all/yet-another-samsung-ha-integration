@@ -1382,7 +1382,14 @@ def control_power_off() -> dict:
     the caller. Still idempotent: KEY_POWER is a toggle, so standby/off is never sent
     again, and an unknown power state is refused rather than guessed - guessing could
     switch the TV ON."""
-    power = _read_power_now() or _POWER_CACHE   # live read first; cache is the fallback
+    # A live read of None is not "probably on". This firmware reports an EMPTY
+    # PowerState in network standby, where KEY_POWER *wakes* the set, so falling back
+    # to a stale "on" cache turned a turn_off into a turn_on. The cache may only ever
+    # make us send FEWER keys than the live read: a cached standby still answers
+    # already_off (nothing is sent), a cached on is ignored.
+    power = _read_power_now()
+    if power is None and _POWER_CACHE in ("standby", "off"):
+        power = _POWER_CACHE
     if power in ("standby", "off"):
         _note_power("standby")
         return {"sent": False, "power": power, "reason": "already_off", "verified": True}
@@ -1730,6 +1737,19 @@ def ha_light_toggle(entity_id):
     return True
 
 
+def control_send_key(body):
+    """Blind key passthrough — never for a power toggle.
+
+    KEY_POWER is a toggle, and this path has no power-state read: on a standby set it
+    switches the TV ON. Power only ever transits control_power_on/control_power_off,
+    which read the state first. Everything else keeps the old passthrough contract.
+    """
+    key = body["key"]
+    if str(key).upper().startswith("KEY_POWER"):
+        return {"sent": False, "key": key, "reason": "power_is_guarded", "verified": False}
+    return {"sent": bool(_send_remote_key(key)), "verified": False}
+
+
 CONTROL_ACTIONS = {
     "launch_app": lambda b: control_launch_app(b["app_id"]),
     "close_app": lambda b: control_close_app(b["app_id"]),
@@ -1749,7 +1769,7 @@ CONTROL_ACTIONS = {
     # the ws channels either swallow keys (v2) or refuse them outright (v3), so a False
     # result is a refusal and a True result only proves the frame left the bridge.
     # Say that in the reply instead of implying the TV acted.
-    "send_key": lambda b: {"sent": bool(_send_remote_key(b["key"])), "verified": False},
+    "send_key": control_send_key,
 }
 
 
@@ -2489,7 +2509,7 @@ def make_handler(state: TVState):
                     elif isinstance(res, dict):
                         reason = res.get("reason")
                         # an explicit refusal is an error; already_on/off are 200
-                        status = 409 if reason in ("power_unknown", "send_failed", "needs_pairing") else 200
+                        status = 409 if reason in ("power_unknown", "send_failed", "needs_pairing", "power_is_guarded") else 200
                         self._send(status, json.dumps({"ok": bool(res.get("sent")), **res}).encode("utf-8"), "application/json")
                     else:
                         self._send(200, json.dumps({"ok": bool(res)}).encode("utf-8"), "application/json")

@@ -76,6 +76,27 @@ class PowerOffContract(unittest.TestCase):
         self.assertEqual(result["reason"], "power_unknown")
         self.assertEqual(self.sent, [], "guessing could switch the TV ON")
 
+    def test_unreadable_set_with_an_on_cache_is_refused(self):
+        """This firmware reports an EMPTY PowerState in network standby, which
+        _read_power_now normalises to None — and KEY_POWER there WAKES the set. A stale
+        "on" cache must not turn a turn_off into a turn_on."""
+        self.m._POWER_CACHE = "on"
+        self.m._read_power_now = lambda: None
+        result = self.m.control_power_off()
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "power_unknown")
+        self.assertEqual(self.sent, [], "an off command must never be a blind toggle")
+
+    def test_unreadable_set_with_a_standby_cache_is_already_off(self):
+        """The cache may only ever suppress a key, never cause one: a set already known
+        to be off answers already_off instead of erroring on every duplicate press."""
+        self.m._POWER_CACHE = "standby"
+        self.m._read_power_now = lambda: None
+        result = self.m.control_power_off()
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "already_off")
+        self.assertEqual(self.sent, [])
+
     def test_missing_token_bootstraps_pairing(self):
         """No token is not a refusal any more: the key path connects token-less so the
         TV can ask once, then saves what it hands back. (The old 'no_remote_token'

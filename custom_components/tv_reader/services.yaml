@@ -24,7 +24,7 @@ close_app:
 
 send_key:
   name: Send key
-  description: Send a remote-control key to the TV.
+  description: Send a remote-control key to the TV. Power keys (KEY_POWER*) are refused — use turn_on/turn_off, which read the power state first.
   fields:
     key:
       name: Key
